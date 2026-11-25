@@ -2,6 +2,7 @@ import { sql as raw } from 'drizzle-orm';
 import { getDb, rowsOf } from '@/db';
 import { now, HOUR } from '@/lib/clock';
 import { parseCorreosCode } from './codes';
+import { doubtFromParcel, type DirectionVerdict } from './direction';
 import {
   MATCH_COLUMNS, matchForCode, matchLateral, resolveMatch, type MatchColumns,
 } from './match';
@@ -207,6 +208,15 @@ export type AddScanResult =
     duplicate: boolean;
     /** False when this exact read had already been counted — a retry. */
     counted: boolean;
+    /**
+     * The pile may be going the other way. ADVISORY, and the scan is stored.
+     *
+     * Never a reason to answer `ok: false`: the route maps that to a 422, and
+     * the phone drops the read and tells the worker to write the number down
+     * — losing a parcel to avoid a wrong label on a screen. "Beep means it is
+     * saved" has to stay true. See lib/scan/direction.ts.
+     */
+    doubt?: DirectionVerdict;
   }
   | { ok: false; error: string };
 
@@ -245,6 +255,16 @@ export async function addScan(
   const copy = await matchForCode(code);
   const stamp = stampFor(input.at);
 
+  /*
+   * Is this pile going the way the phone thinks it is?
+   *
+   * Worked out here because it needs the parcel's state, which the phone does
+   * not have and must not be given a lookup for. The phone has already decided
+   * the one case the code alone settles — a DX label in an Outgoing batch —
+   * and this returns the same verdict for it, so the two can never disagree.
+   */
+  const doubt = doubtFromParcel(code, batch.direction, copy.match);
+
   const result = await getDb().execute(raw`
     INSERT INTO scans (
       batch_id, direction, user_id, scanned_at,
@@ -274,12 +294,18 @@ export async function addScan(
   if (!written) {
     const item = await itemByCode(batch.id, code.raw);
     if (!item) return { ok: false, error: 'That scan could not be read back.' };
-    return { ok: true, item, duplicate: item.timesRead > 1, counted: false };
+    return {
+      ok: true, item, duplicate: item.timesRead > 1, counted: false,
+      ...(doubt ? { doubt } : {}),
+    };
   }
 
   const item = await itemById(written.id);
   if (!item) return { ok: false, error: 'That scan could not be read back.' };
-  return { ok: true, item, duplicate: !written.inserted, counted: true };
+  return {
+    ok: true, item, duplicate: !written.inserted, counted: true,
+    ...(doubt ? { doubt } : {}),
+  };
 }
 
 async function batchFor(userId: string, batchId: string): Promise<BatchRow | null> {
@@ -404,4 +430,127 @@ export async function previewBatch(
     },
     summary: summarise(items),
   };
+}
+
+/* ------------------------------------------------------- the wrong way round */
+
+/**
+ * Move scans from one direction to the other.
+ *
+ * TWO PILES NEED THIS. On 20 November fifty-two parcels were scanned in
+ * Incoming mode while Correos still had them out for delivery, and on 25
+ * November thirty more, every one of them Pre-admisión. One of them, Paquita's,
+ * read "Back in the warehouse · 20 Nov · 13:16" while Correos were driving it
+ * to her — and the whole Returns tab is built on those rows.
+ *
+ * IT MOVES THE DIRECTION, NOT THE SCAN, and that is deliberate rather than
+ * lazy:
+ *
+ *   `scans_batch_code_idx` is UNIQUE on (batch_id, code_as_read), so a scan
+ *   moved into another batch that already has the code would be refused — and
+ *   `read_ids` and `times_read` are per-batch facts ("scanned twice") that
+ *   would have to be merged rather than carried. All of that to express "this
+ *   pile went out, it did not come in", which is exactly what the direction
+ *   column says.
+ *
+ *   The scan also belongs, historically, to the batch it was taken in: Naeem
+ *   worked that pile at 12:40 on the 20th, and that is true whichever way the
+ *   parcels were going.
+ *
+ * `direction_changed_at` is stamped, so nobody has to wonder later why a
+ * parcel that was in the warehouse on the 20th is not any more.
+ *
+ * Returns how many rows actually moved — which is 0 on a second press,
+ * because of the `direction <>` guard, and that makes this safe to press twice.
+ */
+export async function moveScanDirection(
+  ids: readonly string[],
+  to: ScanDirection,
+): Promise<number> {
+  if (!ids.length) return 0;
+
+  const result = await getDb().execute(raw`
+    UPDATE scans
+       SET direction = ${to},
+           direction_changed_at = ${now().toISOString()}::timestamptz
+     WHERE id IN (${raw.join(ids.map((id) => raw`${id}`), raw`, `)})
+       AND direction <> ${to}
+    RETURNING id
+  `);
+
+  return rowsOf<{ id: string }>(result).length;
+}
+
+/** Every scan of one batch, moved. The "Move the whole batch" button. */
+export async function moveBatchDirection(
+  batchId: string,
+  to: ScanDirection,
+): Promise<number> {
+  const result = await getDb().execute(raw`
+    UPDATE scans
+       SET direction = ${to},
+           direction_changed_at = ${now().toISOString()}::timestamptz
+     WHERE batch_id = ${batchId}
+       AND direction <> ${to}
+    RETURNING id
+  `);
+
+  return rowsOf<{ id: string }>(result).length;
+}
+
+/**
+ * "Switch this batch to Outgoing", from the phone, mid-pile.
+ *
+ * The batch's own direction moves as well as its scans', because the worker is
+ * still scanning into it and the next parcel has to land the right way round.
+ *
+ * ONE OPEN BATCH PER WORKER PER DIRECTION is enforced by
+ * `scan_batches_open_idx`, so there is a case to handle rather than ignore: a
+ * worker who already has an open Outgoing batch cannot simply have this one
+ * relabelled. Then the scans move into that batch's direction and THIS batch is
+ * finished where it stands — the pile is correctly filed either way, and the
+ * phone opens a fresh batch on its next read. Nothing is deleted and no scan
+ * changes batch, for the reasons in `moveScanDirection`.
+ */
+export async function switchBatchDirection(
+  userId: string,
+  batchId: string,
+  to: ScanDirection,
+): Promise<{ moved: number; batchFinished: boolean } | null> {
+  const batch = await batchFor(userId, batchId);
+  if (!batch) return null;
+  if (batch.direction === to) return { moved: 0, batchFinished: false };
+
+  // Everything on one connection: DB_POOL_MAX is 1 on Vercel, and a getDb()
+  // inside a transaction waits for the connection the transaction is holding.
+  return getDb().transaction(async (tx) => {
+    const moved = rowsOf<{ id: string }>(await tx.execute(raw`
+      UPDATE scans
+         SET direction = ${to},
+             direction_changed_at = ${now().toISOString()}::timestamptz
+       WHERE batch_id = ${batchId}
+         AND direction <> ${to}
+      RETURNING id
+    `)).length;
+
+    const clash = rowsOf<{ id: string }>(await tx.execute(raw`
+      SELECT id FROM scan_batches
+       WHERE user_id = ${userId} AND direction = ${to} AND finished_at IS NULL
+         AND id <> ${batchId}
+       LIMIT 1
+    `)).length > 0;
+
+    if (clash) {
+      await tx.execute(raw`
+        UPDATE scan_batches SET finished_at = ${now().toISOString()}::timestamptz
+         WHERE id = ${batchId} AND finished_at IS NULL
+      `);
+      return { moved, batchFinished: true };
+    }
+
+    await tx.execute(raw`
+      UPDATE scan_batches SET direction = ${to} WHERE id = ${batchId}
+    `);
+    return { moved, batchFinished: false };
+  });
 }

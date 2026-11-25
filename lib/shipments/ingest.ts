@@ -1,15 +1,16 @@
-import { and, eq, sql as raw } from 'drizzle-orm';
+import { and, eq, or, sql as raw } from 'drizzle-orm';
 import { getDb } from '@/db';
 import {
   escalationFires, eventReviewQueue, offices, orders, shipmentEvents, shipments,
 } from '@/db/schema';
-import { matchCorreosEvent } from '@/lib/carriers/correos/state-map';
+import { matchCorreosEvent, needsReview } from '@/lib/carriers/correos/state-map';
+import type { EventLeg } from '@/lib/carriers/correos/return-code';
 import type { ShipmentState } from '@/lib/state-machine/states';
 import { RETURN_STATES, TERMINAL_STATES } from '@/lib/state-machine/states';
 import { now } from '@/lib/clock';
 import { say } from '@/lib/activity';
 import { money } from '@/lib/escalation/decide';
-import { shortDate } from '@/lib/time';
+import { fmt, shortDate } from '@/lib/time';
 import { openTask, closeTasks } from '@/lib/escalation/tasks';
 import { silence } from '@/lib/escalation/silence';
 import { reproject } from './repo';
@@ -35,6 +36,20 @@ export interface IncomingEvent {
    * yet read.
    */
   phase?: string | null;
+  /**
+   * Correos' longer sibling of the description — `expandedText` in the
+   * trackpub feed, `extendedText` on their public tracker.
+   *
+   * Read for exactly one thing: "Desestacionado" means a hold was lifted and
+   * says nothing about which way the parcel then went, and only this text
+   * ("Envío pendiente de devolución") settles it. See state-map.ts.
+   */
+  longText?: string | null;
+  /**
+   * Which journey this event belongs to. Absent means outbound, which is what
+   * every event arriving on a parcel's own tracking code is.
+   */
+  leg?: EventLeg;
   occurredAt: Date;
   source: 'push' | 'poll' | 'system';
   officeCode?: string | null;
@@ -48,6 +63,8 @@ export interface IngestResult {
   shipmentId?: string;
   mappedState?: ShipmentState | null;
   stateChanged?: boolean;
+  /** Which journey the event turned out to belong to. */
+  leg?: EventLeg;
 }
 
 export interface IngestOptions {
@@ -71,8 +88,31 @@ export async function ingestEvent(
   ev: IncomingEvent,
   opts: IngestOptions = {},
 ): Promise<IngestResult> {
-  const [ship] = await getDb().select({ id: shipments.id, state: shipments.state })
-    .from(shipments).where(eq(shipments.shippingCode, ev.shippingCode)).limit(1);
+  /*
+   * TWO CODES CAN NAME ONE PARCEL. The one on the label that went out, and the
+   * one Correos invented to bring it back — see
+   * lib/carriers/correos/return-code.ts. Until this lookup knew about the
+   * second, every event on a return answered `unknown_shipment` and was
+   * dropped on the floor, which is why no parcel in this database had ever
+   * reached `returned`.
+   *
+   * The outbound code wins when both somehow match, so the ordering is
+   * explicit rather than left to the planner: `shipping_code` is unique and
+   * `return_code` is not, and a parcel must never be decided by which row
+   * Postgres happened to reach first.
+   */
+  const [ship] = await getDb().select({
+    id: shipments.id,
+    state: shipments.state,
+    shippingCode: shipments.shippingCode,
+  })
+    .from(shipments)
+    .where(or(
+      eq(shipments.shippingCode, ev.shippingCode),
+      eq(shipments.returnCode, ev.shippingCode),
+    ))
+    .orderBy(raw`(${shipments.shippingCode} = ${ev.shippingCode}) DESC`)
+    .limit(1);
 
   if (!ship) {
     // A tracking code we have never seen. Correos pushes for everything the
@@ -81,14 +121,27 @@ export async function ingestEvent(
     return { status: 'unknown_shipment' };
   }
 
+  /*
+   * Which journey this event describes.
+   *
+   * Taken from WHICH code matched rather than from the event, because the
+   * event does not know: Correos describe the return leg in exactly the words
+   * they use for the outbound one. An explicit `ev.leg` wins, which is how the
+   * catch-up replays a return it fetched itself.
+   */
+  const leg: EventLeg = ev.leg
+    ?? (ship.shippingCode === ev.shippingCode ? 'outbound' : 'return');
+
   // Three signals, in order of how much they are worth: the event code, the
   // Spanish wording, then the coarse phase. A match that only the phase found
   // still goes to the review queue — it is enough to move the parcel along and
   // not enough to claim we recognise the event, and collecting the codes we do
   // not have is the entire job of that queue.
-  const match = matchCorreosEvent(ev.eventCode, ev.eventDesc, ev.phase);
+  const match = matchCorreosEvent(ev.eventCode, ev.eventDesc, ev.phase, ev.longText);
   const mapped = match?.state ?? null;
-  if (!match || match.via === 'phase') await queueForReview(ev);
+  // One rule for "should a human look at this", shared with `unmappedIn`, so
+  // the queue and the normaliser cannot disagree about which events are new.
+  if (needsReview(ev.eventCode, ev.eventDesc, ev.phase, ev.longText)) await queueForReview(ev);
 
   if (ev.officeCode) await upsertOffice(ev);
 
@@ -103,6 +156,7 @@ export async function ingestEvent(
     mappedState: mapped,
     officeCode: ev.officeCode ?? null,
     officeName: ev.officeName ?? null,
+    leg,
   }).onConflictDoNothing({
     target: [shipmentEvents.shipmentId, shipmentEvents.eventCode, shipmentEvents.occurredAt],
   }).returning({ id: shipmentEvents.id });
@@ -116,7 +170,13 @@ export async function ingestEvent(
 
   if (after !== before && !opts.quiet) await onStateEntered(ship.id, before, after);
 
-  return { status: 'inserted', shipmentId: ship.id, mappedState: mapped, stateChanged: after !== before };
+  return {
+    status: 'inserted',
+    shipmentId: ship.id,
+    mappedState: mapped,
+    stateChanged: after !== before,
+    leg,
+  };
 }
 
 /**
@@ -226,6 +286,10 @@ async function onStateEntered(shipmentId: string, from: ShipmentState, to: Shipm
     orderId: orders.id,
     officeName: offices.name,
     deadline: shipments.officeDeadline,
+    // For the one line that says a parcel is physically back: which code
+    // brought it and when Correos handed it over.
+    returnCode: shipments.returnCode,
+    returnedAt: shipments.returnedAt,
   })
     .from(shipments)
     .innerJoin(orders, eq(orders.id, shipments.orderId))
@@ -304,8 +368,7 @@ async function onStateEntered(shipmentId: string, from: ShipmentState, to: Shipm
       break;
     }
 
-    case 'returning':
-    case 'returned': {
+    case 'returning': {
       await silence(shipmentId, { keepFinal: false });
       await closeTasks(shipmentId, ['call', 'contact']);
       await markRepeatRisk(d.orderId);
@@ -314,9 +377,37 @@ async function onStateEntered(shipmentId: string, from: ShipmentState, to: Shipm
       });
       const pay = d.paymentMethod === 'cod' ? 'Cash on delivery' : 'Prepaid';
       await say(
-        `Coming back to us — ${d.orderNumber} · ${name} · ${money(d.valueCents)} · ${pay} · time ran out at ${office}`,
+        `Coming back to us — ${d.orderNumber} · ${name} · ${money(d.valueCents)} · ${pay} · ${whyBack(from, office)}`,
         shipmentId,
       );
+      break;
+    }
+
+    /*
+     * IT IS BACK. The state nothing in this database had ever reached.
+     *
+     * Deliberately NOT the same branch as `returning`. The old shared branch
+     * said "Coming back to us … time ran out at the post office" for both,
+     * which on arrival is two lies in one line: it is not coming back, it is
+     * here, and for the twenty-nine parcels whose return started with a wrong
+     * address nothing ever ran out anywhere.
+     *
+     * The task stays. It is the warehouse's "put it back in stock", not a
+     * customer message or a ladder rung — those the return leg must never
+     * fire, and `silence` here is what makes sure of it. A parcel that jumps
+     * straight from `bad_address` to `returned` (which the catch-up will do,
+     * and which happens whenever we never saw the return start) would
+     * otherwise land on the shelf with nothing in the system asking anybody
+     * to deal with it.
+     */
+    case 'returned': {
+      await silence(shipmentId, { keepFinal: false });
+      await closeTasks(shipmentId, ['call', 'contact']);
+      await markRepeatRisk(d.orderId);
+      await openTask({
+        shipmentId, type: 'receive_return', reason: 'returned', label: 'Put back in stock',
+      });
+      await say(backWithUsLine(d.orderNumber, d.returnCode, d.returnedAt), shipmentId);
       break;
     }
 
@@ -342,8 +433,54 @@ async function onStateEntered(shipmentId: string, from: ShipmentState, to: Shipm
   }
 
   if (RETURN_STATES.has(to) && !RETURN_STATES.has(from)) {
-    await notifyReturnStarted(shipmentId);
+    // `to`, not an assumption. A parcel can land straight in `returned` —
+    // from `bad_address`, which is not a return state — and telling somebody
+    // it "is on its way back" about a parcel already on the shelf is the same
+    // class of mistake this whole change exists to fix.
+    await notifyReturnStarted(shipmentId, to);
   }
+}
+
+/**
+ * Why a parcel is coming back, in the words that are actually true of it.
+ *
+ * The previous version of this line said "time ran out at the post office"
+ * whatever had happened, which was wrong for every return that started with a
+ * refusal or a bad address — twenty-nine of the eighty-seven on the operator's
+ * screen. Where the state it came from does not say, this says nothing rather
+ * than guessing: `returning` can be reached from an event that only tells us
+ * Correos have started a return, and not why.
+ */
+function whyBack(from: ShipmentState, office: string): string {
+  switch (from) {
+    case 'at_office': return `time ran out at ${office}`;
+    case 'bad_address': return 'the address was wrong';
+    case 'refused': return 'the customer refused it';
+    case 'failed': return 'nobody was home';
+    default: return 'Correos have started a return';
+  }
+}
+
+/**
+ * The line that says a parcel is physically back with us.
+ *
+ * It names the return code on purpose. That code is the whole discovery behind
+ * this feature — the operator could not find it anywhere in the system and had
+ * to read it off Correos' own tracker — and it is what they type into Mi
+ * Oficina or search for in the warehouse pile.
+ */
+function backWithUsLine(
+  orderNumber: string,
+  returnCode: string | null,
+  returnedAt: Date | null,
+): string {
+  // Both of these are written by the same projection that produced the state,
+  // so in practice they are always here. The fallbacks are for a `returned`
+  // reached some other way — a hand correction, an older row — where saying
+  // less is better than printing "null" at the operator.
+  if (!returnCode || !returnedAt) return `${orderNumber} returned — it is back with us`;
+  const f = fmt(returnedAt);
+  return `${orderNumber} returned — Correos delivered ${returnCode} back to us on ${f.date} at ${f.time}`;
 }
 
 async function markRepeatRisk(orderId: string): Promise<void> {
@@ -362,7 +499,7 @@ async function isWatchedArea(postalCode: string | null): Promise<boolean> {
  * A return has started. Somebody internal needs to know now, with everything
  * they would otherwise have to go and look up.
  */
-async function notifyReturnStarted(shipmentId: string): Promise<void> {
+async function notifyReturnStarted(shipmentId: string, to: ShipmentState): Promise<void> {
   const { raiseAlert } = await import('@/lib/alerts');
   const row = await getDb().select({
     orderNumber: orders.orderNumber,
@@ -370,6 +507,8 @@ async function notifyReturnStarted(shipmentId: string): Promise<void> {
     valueCents: orders.totalValueCents,
     paymentMethod: orders.paymentMethod,
     shippingCode: shipments.shippingCode,
+    returnCode: shipments.returnCode,
+    returnedAt: shipments.returnedAt,
     state: shipments.state,
     officeName: offices.name,
   })
@@ -386,21 +525,34 @@ async function notifyReturnStarted(shipmentId: string): Promise<void> {
     ? 'the customer refused it at the door'
     : `nobody collected it from ${d.officeName ?? 'the post office'} in time`;
 
+  // Already here, or still travelling. The difference matters to whoever opens
+  // this: one is a parcel to find on a shelf, the other is one to expect.
+  const arrived = to === 'returned';
+  const tracking = d.returnCode
+    ? [`Out:       ${d.shippingCode}`, `Back:      ${d.returnCode}`]
+    : [`Tracking:  ${d.shippingCode}`];
+
   await raiseAlert({
     // One alert per parcel per return. A parcel only comes back once; if it
     // somehow re-enters `returning` after being received, that is the same
     // event being re-reported rather than a second return.
     dedupeKey: `return-started:${shipmentId}`,
     shipmentId,
-    subject: `Coming back: ${d.orderNumber} · ${d.customerName} · ${money(d.valueCents)}`,
+    subject: arrived
+      ? `Back with us: ${d.orderNumber} · ${d.customerName} · ${money(d.valueCents)}`
+      : `Coming back: ${d.orderNumber} · ${d.customerName} · ${money(d.valueCents)}`,
     lines: [
-      `Order ${d.orderNumber} is on its way back to us because ${why}.`,
+      arrived
+        ? `Order ${d.orderNumber} came back to us${d.returnedAt ? ` on ${shortDate(d.returnedAt)}` : ''} because ${why}.`
+        : `Order ${d.orderNumber} is on its way back to us because ${why}.`,
       '',
       `Customer:  ${d.customerName}`,
       `Value:     ${money(d.valueCents)} (${d.paymentMethod === 'cod' ? 'cash on delivery — we earn nothing if it comes back' : 'prepaid — a refund is coming'})`,
-      `Tracking:  ${d.shippingCode}`,
+      ...tracking,
       '',
-      'It is on the list to put back in stock when it lands.',
+      arrived
+        ? 'It is on the list to put back in stock.'
+        : 'It is on the list to put back in stock when it lands.',
     ],
   });
 }

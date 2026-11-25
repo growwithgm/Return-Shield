@@ -451,6 +451,7 @@ of sent — visible in the Vercel function logs, but nobody's inbox.
 | `SHOPIFY_API_VERSION` | `2026-10`, from `lib/carriers/shopify/api.ts`. A version Shopify has retired does not fail — it silently serves the oldest one still supported, so this is worth reviewing each year. Set it only to pin an older version on purpose. |
 | `RECONCILE_BATCH_SIZE` | 6000. How many parcels one sweep may consider. At ~5,000 live parcels this is "all of them". |
 | `RECONCILE_BUDGET_MS` | 240000. The sweep stops asking Correos anything new after this, which is 60 seconds inside the route's `maxDuration` of 300. |
+| `RETURN_POSTCODE` | `28012`. Where Correos delivers our returns. A returned parcel travels under a SECOND code — same core, `DX` prefix, and the returns postcode — so the code can be worked out from the original with no network call, which is what lets the system follow a return to the end. Set it when the returns address moves and at nothing else; a value that is not five digits falls back to the default, because a code of the wrong length is one Correos would never answer. Codes Correos named themselves are stored as such and are never recomputed, so changing this cannot rewrite one of theirs. See `lib/carriers/correos/return-code.ts`. |
 
 ---
 
@@ -645,3 +646,31 @@ new schema, which is what makes that order safe.
 column, two new tables and one index, so the version live at the time carries
 on untouched either side of it. Run it, then sync the fork, then make the first
 worker from [Settings → Scanner accounts](#making-the-first-worker).
+
+`0008_return_leg.sql` is the return leg's, and it is the same shape: three
+nullable columns and two indexes on `shipments`, one defaulted column plus two
+functional indexes for matching a `DX` label to its parcel, one nullable column
+on `scans`, and three check constraints. Everything is additive, so the version
+live at the time reads and writes exactly what it did before — **run the
+migration first, then Sync fork.** The other order is what broke an escalation
+tick once already: 0005 was deployed before its migration and a job read
+`shipments.close_reason` before the column existed.
+
+Afterwards, two things on **Settings**:
+
+* **Does Correos answer a return code?** — the line at the top of the Returns
+  card. Until a sweep has asked, it says so; it will then say either that
+  Correos answered, or that they refused, in those words. That answer is
+  genuinely unknown until it is there: the `DX` codes were read off Correos'
+  *public* tracker, which is a different service from the trackpub `/search`
+  this system uses.
+* **Parcels that came back before we were watching** — two presses. The first
+  writes nothing and says what the second would do. Press the second one to
+  work out every return code, ask Correos about each of them, and file the
+  answers.
+
+Then, on **Parcels → Returns**: the "Check the direction" section lists the
+parcels the warehouse scanned IN while Correos still had them going out — the
+piles of 20 and 25 November. Each row has **Move to Outgoing**, and the first
+row of a batch also offers **Move all N in this batch**. That is an operator's
+decision about what physically happened, so nothing moves on its own.

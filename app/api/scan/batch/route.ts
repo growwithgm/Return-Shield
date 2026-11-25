@@ -1,7 +1,9 @@
 import type { NextResponse } from 'next/server';
 import { loadDemoClock } from '@/lib/demo-clock';
 import { requireScannerApi, readJson, scanError, scanJson } from '@/lib/scan/api';
-import { currentBatch, openBatch, openBatches } from '@/lib/scan/batches';
+import {
+  currentBatch, openBatch, openBatches, switchBatchDirection,
+} from '@/lib/scan/batches';
 import { isScanDirection } from '@/lib/scan/model';
 
 export const dynamic = 'force-dynamic';
@@ -61,4 +63,32 @@ export async function POST(req: Request): Promise<NextResponse> {
   const open = await openBatches(gate.user.id);
 
   return scanJson({ ok: true, batch, open, worker: gate.user.name });
+}
+
+/**
+ * "Switch this batch to Outgoing."
+ *
+ * The phone's answer to the pile that is going the other way. It moves the
+ * scans already taken AND the batch itself, so the next parcel lands the right
+ * way round — see `switchBatchDirection` for the one-open-batch-per-direction
+ * case it has to handle.
+ *
+ * A write, so POST-shaped rather than a GET, and it needs the worker's own
+ * batch: the gate is the same scanner-only one as every route here, and
+ * `switchBatchDirection` answers null for a batch that is not theirs.
+ */
+export async function PATCH(req: Request): Promise<NextResponse> {
+  const gate = await requireScannerApi();
+  if (!gate.ok) return gate.response;
+
+  const body = await readJson<{ batchId?: string; direction?: string }>(req);
+  if (!body?.batchId) return scanError('Which batch?', 400);
+  if (!isScanDirection(body.direction)) return scanError('Which direction?', 400);
+
+  await loadDemoClock();
+  const result = await switchBatchDirection(gate.user.id, body.batchId, body.direction);
+  if (!result) return scanError('No such batch.', 404);
+
+  const open = await openBatches(gate.user.id);
+  return scanJson({ ok: true, ...result, open });
 }

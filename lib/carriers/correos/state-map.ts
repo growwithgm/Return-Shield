@@ -401,7 +401,7 @@ export function normalisePhase(phase: string): string {
 }
 
 /** Which signal decided the state. See `matchCorreosEvent`. */
-export type MappingSource = 'code' | 'description' | 'phase';
+export type MappingSource = 'code' | 'description' | 'phase' | 'return-phase' | 'return-text';
 
 export interface CorreosMatch {
   state: ShipmentState;
@@ -409,13 +409,60 @@ export interface CorreosMatch {
 }
 
 /**
+ * Correos' own phase for every event on a parcel that is coming back.
+ *
+ * `normalisePhase('DEVOLUCION')`. They do not use it for anything else, which
+ * is what makes it strong enough to beat a wording — see `matchCorreosEvent`.
+ */
+const RETURN_PHASE = 'devolucion';
+
+/**
+ * The wording Correos uses when a parcel held for instructions is released,
+ * and the long text that says which way it was released.
+ *
+ * "Desestacionado" on its own means the hold is over and NOT what happens
+ * next: the parcel can go on to the customer or back to us, and the word is
+ * identical either way. The long text is the only thing that says which, so
+ * that is what is read — and any Desestacionado without it stays in the review
+ * queue exactly as before, because guessing it costs a parcel in the wrong
+ * state.
+ */
+const UNHELD = 'desestacionado';
+const UNHELD_MEANS_RETURN = 'pendiente de devolucion';
+
+/** Does the code or the wording name an event we already recognise? */
+function recognised(code: string | null | undefined, desc: string): boolean {
+  if (code && BY_CODE[code.trim()]) return true;
+  const key = normaliseDesc(desc);
+  if (BY_DESCRIPTION[key]) return true;
+  const alias = DESCRIPTION_ALIASES[key];
+  return Boolean(alias && BY_DESCRIPTION[alias]);
+}
+
+/**
  * Map one Correos event to a state, saying which signal decided it.
  *
- * Strictly in order of how much the signal is worth: the code when we
- * recognise it, then the wording, then — only if neither is known — the coarse
- * phase. A match `via: 'phase'` is a guess good enough to move the state
- * machine and not good enough to stop asking a human, which is why callers
- * queue it for review all the same.
+ * In order of how much each signal is worth:
+ *
+ *   1. the event code, when we recognise it
+ *   2. phase DEVOLUCION — Correos' own word for "this parcel is coming back"
+ *   3. "Desestacionado" whose long text says a return is pending
+ *   4. the wording
+ *   5. the coarse phase, for anything else
+ *
+ * Two and three are the return rules, and they sit above the wording because
+ * Correos describe the start of a return with a sentence about why it started
+ * — "Dirección incorrecta" — and the wording table reads that as a wrong
+ * address. See the notes on each.
+ *
+ * A match `via: 'phase'` is a guess good enough to move the state machine and
+ * not good enough to stop asking a human, which is why callers queue it for
+ * review all the same.
+ *
+ * `longText` is Correos' longer sibling of the description: `expandedText` in
+ * the trackpub feed, `extendedText` on their public tracker. Optional, so
+ * every caller that has only the summary still compiles and still behaves
+ * exactly as it did.
  *
  * Null is a normal outcome, not a failure.
  */
@@ -423,11 +470,60 @@ export function matchCorreosEvent(
   code: string | null | undefined,
   desc: string,
   phase?: string | null,
+  longText?: string | null,
 ): CorreosMatch | null {
   const byCode = code ? BY_CODE[code.trim()] : undefined;
   if (byCode) return { state: byCode, via: 'code' };
 
+  /*
+   * PHASE DEVOLUCION MEANS THE PARCEL IS COMING BACK, WHATEVER THE WORDING
+   * SAYS. Second only to the code, and above the wording tables on purpose.
+   *
+   * This is the rule that was missing, and it cost twenty-nine parcels. When
+   * Correos start a return they send "Dirección incorrecta" in phase
+   * DEVOLUCION, with the long text "La dirección de destino no es correcta y
+   * se procede a la devolución del envío" — the address was wrong AND the
+   * parcel is already on its way back. The wording table matched
+   * `direccion incorrecta` first and called it `bad_address`, so twenty-nine
+   * parcels sat in the Wrong-address worklist offering "Mark address as fixed
+   * with Correos" while twenty-six of them were already back in the building.
+   *
+   * The phase is normally the weakest signal we have and is still the weakest
+   * for everything else. DEVOLUCION is the exception because Correos use it
+   * for one thing only: every confirmed code in it (`L03D320R`, `L03D045R`)
+   * already maps to `returning`, and no event in any other phase does. A
+   * wording is a sentence about what happened; this phase is Correos' own
+   * classification of where the parcel is going.
+   *
+   * A KNOWN CODE STILL WINS, because it is the one signal more specific than
+   * this: `H01R421V` is "Dirección Incorrecta. Se procede a remitir el envío a
+   * la oficina de referencia" in phase EN ENTREGA — a genuinely wrong address
+   * with the parcel held at an office — and it stays `bad_address`.
+   */
+  if (phase && normalisePhase(phase) === RETURN_PHASE) {
+    return { state: 'returning', via: 'return-phase' };
+  }
+
   const key = normaliseDesc(desc);
+
+  /*
+   * "Desestacionado", when the long text says which way it was released.
+   *
+   * It arrives in phase SIN FASE — Correos saying they have no phase for it —
+   * so the rule above cannot see it, and the word alone is as true of a parcel
+   * released onwards to the customer as of one released back to us. The long
+   * text settles it: "Envío pendiente de devolución" is a return starting.
+   *
+   * Scoped to this wording rather than applied to any long text mentioning a
+   * return, because the long text is prose: "se procede a la devolución del
+   * envío" appears on events that are already handled by their phase, and a
+   * blanket substring match over Correos' sentences is how a rule starts
+   * catching things nobody checked.
+   */
+  if (key === UNHELD && longText && normaliseDesc(longText).includes(UNHELD_MEANS_RETURN)) {
+    return { state: 'returning', via: 'return-text' };
+  }
+
   if (BY_DESCRIPTION[key]) return { state: BY_DESCRIPTION[key], via: 'description' };
 
   const alias = DESCRIPTION_ALIASES[key];
@@ -452,24 +548,41 @@ export function mapCorreosEvent(
   code: string | null | undefined,
   desc: string,
   phase?: string | null,
+  longText?: string | null,
 ): ShipmentState | null {
-  return matchCorreosEvent(code, desc, phase)?.state ?? null;
+  return matchCorreosEvent(code, desc, phase, longText)?.state ?? null;
 }
 
 /**
  * Is this event one a human should still look at?
  *
- * True when nothing matched, and also when only the phase did: the phase keeps
- * the parcel moving, but the code and the wording are still unknown to us and
- * that is exactly what the review queue is for.
+ * True when nothing matched, and when only the coarse phase did: the phase
+ * keeps the parcel moving, but the code and the wording are still unknown to
+ * us and that is exactly what the review queue is for.
+ *
+ * A DEVOLUCION match is the one that needs a second thought. It is queued when
+ * the event is otherwise unknown — a return wording nobody here has seen is
+ * worth collecting — and NOT queued when we already recognise the code or the
+ * wording, because then there is nothing new to learn. Without that, the
+ * twenty-nine "Dirección incorrecta" events this rule was written for would
+ * each file a queue entry for a wording that has been in the table since the
+ * first week.
+ *
+ * A `return-text` match is not queued: the long text told us plainly what the
+ * event meant, which is the whole reason the rule exists. Every other
+ * Desestacionado still falls through to null, and still queues.
  */
 export function needsReview(
   code: string | null | undefined,
   desc: string,
   phase?: string | null,
+  longText?: string | null,
 ): boolean {
-  const match = matchCorreosEvent(code, desc, phase);
-  return match === null || match.via === 'phase';
+  const match = matchCorreosEvent(code, desc, phase, longText);
+  if (match === null) return true;
+  if (match.via === 'phase') return true;
+  if (match.via === 'return-phase') return !recognised(code, desc);
+  return false;
 }
 
 /** Every wording we claim to understand. Used by the tests and the docs. */

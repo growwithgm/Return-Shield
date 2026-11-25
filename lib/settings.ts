@@ -1,6 +1,7 @@
 import { eq } from 'drizzle-orm';
 import { getDb, withDbRetry } from '@/db';
 import { settings } from '@/db/schema';
+import type { ReturnLegProbe } from '@/lib/shipments/return-leg';
 
 /**
  * The handful of numbers that change how the system behaves, kept in the
@@ -60,6 +61,18 @@ export interface AppSettings {
    */
   correosBatchProbedAt: string;
   /**
+   * What the last run of return-leg lookups learnt.
+   *
+   * Here for one question in particular: DOES CORREOS ANSWER A `DX` CODE ON
+   * THIS ENDPOINT? The return codes were read off Correos' public tracker,
+   * which is a different service from the trackpub `/search` the sweep uses,
+   * and nobody has put one to trackpub with these credentials. Rather than
+   * assume either way, every run records what happened and the Settings screen
+   * says it in plain English — so "they answered none of them" can never read
+   * the same as "we have not tried". See lib/shipments/return-leg.ts.
+   */
+  correosReturnLeg: ReturnLegProbe | null;
+  /**
    * What the sweep running right now has got through, for the progress bar.
    *
    * In settings rather than a table of its own: it is one row that is
@@ -106,6 +119,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   correosBatchMode: 'unknown',
   correosBatchSize: 0,
   correosBatchProbedAt: '',
+  correosReturnLeg: null,
   sweepProgress: null,
 };
 

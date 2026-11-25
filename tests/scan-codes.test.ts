@@ -84,6 +84,48 @@ describe('parsing a Correos code', () => {
     expect(readsAs(parseCorreosCode('PKA6TP980010152')!))
       .toBe('15 characters · EXPEDICIÓN without its check letter');
   });
+
+  /*
+   * THE OTHER LABEL. A parcel goes out as PK… and comes back as DX…, and the
+   * warehouse reads both. The worker is told which one is in their hand,
+   * because it is the one fact that changes what they should do with the box.
+   */
+  it('says when a label is the return one', () => {
+    const back = parseCorreosCode('DXA6TP9800129340128012S')!;
+    expect(back.isReturn).toBe(true);
+    expect(readsAs(back)).toBe('23 characters · Código de Bulto · return label');
+
+    const out = parseCorreosCode('PKA6TP9800129340147006H')!;
+    expect(out.isReturn).toBe(false);
+    expect(readsAs(out)).toBe('23 characters · Código de Bulto');
+  });
+
+  /*
+   * The check letter, read but NEVER used to refuse a scan: "beep means it is
+   * saved" is the contract, and a refusal here would have the phone drop the
+   * read and tell the worker to write the number down. It catches a misread
+   * bar, which is the common failure of a camera in a warehouse.
+   */
+  it('reads the check letter of a Código de Bulto without refusing the scan', () => {
+    expect(parseCorreosCode('DXA6TP9800129340128012S')!.checkOk).toBe(true);
+
+    // The same code with one character changed. Still parses, still stores.
+    const bad = parseCorreosCode('DXA6TP9800129340128013S')!;
+    expect(bad.checkOk).toBe(false);
+    expect(bad.raw).toBe('DXA6TP9800129340128013S');
+    expect(readsAs(bad)).toBe('23 characters · Código de Bulto · return label · check letter does not match');
+  });
+
+  /*
+   * NULL, NOT FALSE, for an EXPEDICIÓN — and this is the trap worth a test.
+   * Its check letter is computed some other way: `PKA6TP980012934` works out
+   * to `T` here and the real expedición is `PKA6TP980012934D`. Validating one
+   * would reject every expedición the system has.
+   */
+  it('does not judge an EXPEDICIÓN check letter, which is a different sum', () => {
+    expect(parseCorreosCode('PKA6TP980012934D')!.checkOk).toBeNull();
+    expect(parseCorreosCode('PKA6TP980012934')!.checkOk).toBeNull();
+  });
 });
 
 /* ------------------------------------------------------------- what a row says */

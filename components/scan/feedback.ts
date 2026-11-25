@@ -80,3 +80,20 @@ export function beepDuplicate(): void {
   tone(150, 90, 980);
   buzz([90, 70, 90]);
 }
+
+/**
+ * The pile may be going the other way. Three descending tones, and a long buzz.
+ *
+ * It has to be unmistakable from the other two, because that is the whole
+ * point: on 20 November fifty-two outgoing parcels were scanned in Incoming
+ * mode in thirty-eight minutes, and every one of them beeped "saved". Two
+ * short high beeps mean "already got it, carry on"; this falls, which is the
+ * one shape a person reads as "stop". The buzz is longer than either, for a
+ * warehouse where the phone is in a pocket and the sound is lost.
+ */
+export function beepWrongWay(): void {
+  tone(0, 130, 760);
+  tone(170, 130, 620);
+  tone(340, 200, 480);
+  buzz([260, 120, 260]);
+}

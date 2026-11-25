@@ -784,6 +784,10 @@ async function describe(res: Response, hint?: string): Promise<string> {
 function forCode(outcome: NormaliseOutcome, code: string): NormaliseOutcome {
   return {
     events: outcome.events.filter((e) => e.shippingCode === code),
+    // The return code, which is the whole reason this field exists. Dropping
+    // it here would hide it from every batched lookup — i.e. from the sweep,
+    // i.e. from everything — while the single-code path still saw it.
+    associated: outcome.associated.filter((a) => a.code === code),
     // normalise.ts tags per-shipment problems `${code}: …`. Without the colon
     // a code also collects the problems of every code it is a prefix of.
     problems: outcome.problems.filter((p) => p.startsWith(`${code}:`)),

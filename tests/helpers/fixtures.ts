@@ -37,6 +37,11 @@ export interface MakeShipmentOptions {
   externalOrderId?: string;
   /** `shopify` unless a test is about what a marketplace row looks like. */
   platform?: 'shopify' | 'tiktok' | 'amazon';
+  /** The code the parcel comes back under. See lib/carriers/correos/return-code.ts. */
+  returnCode?: string;
+  returnCodeSource?: 'correos' | 'derived';
+  /** When Correos delivered the return back to US. */
+  returnedAt?: Date;
 }
 
 export interface Fixture {
@@ -102,6 +107,9 @@ export async function makeShipment(opts: MakeShipmentOptions = {}): Promise<Fixt
     productCode,
     state: opts.state ?? 'created',
     stateSince: opts.stateSince ?? null,
+    ...(opts.returnCode ? { returnCode: opts.returnCode } : {}),
+    ...(opts.returnCodeSource ? { returnCodeSource: opts.returnCodeSource } : {}),
+    ...(opts.returnedAt ? { returnedAt: opts.returnedAt } : {}),
     ...(opts.orderCreatedAt ? { createdAt: opts.orderCreatedAt } : {}),
   }).returning({ id: shipments.id });
 

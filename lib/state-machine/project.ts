@@ -1,6 +1,7 @@
 import type { ShipmentState } from './states';
 import { applyEvent } from './transitions';
 import { HOUR } from '@/lib/clock';
+import type { EventLeg } from '@/lib/carriers/correos/return-code';
 
 /**
  * The projection. Given every event a shipment has ever had, work out where it
@@ -22,6 +23,11 @@ export interface ProjectableEvent {
   mappedState: ShipmentState | null;
   officeCode?: string | null;
   officeName?: string | null;
+  /**
+   * Which journey this event belongs to. Absent means outbound, which is what
+   * every event written before the return leg existed is.
+   */
+  leg?: EventLeg;
 }
 
 export interface Projection {
@@ -44,6 +50,12 @@ export interface Projection {
    * retention window.
    */
   preAdmittedAt: Date | null;
+  /**
+   * When Correos delivered the return back to US, from the return leg's own
+   * delivery event. Null until then, and null for the great majority of
+   * parcels, which never come back.
+   */
+  returnedAt: Date | null;
   eventCount: number;
   /** Events Correos sent that we have no mapping for. */
   unmappedCount: number;
@@ -71,9 +83,43 @@ export function project(events: readonly ProjectableEvent[]): Projection {
   let lastEventAt: Date | null = null;
   let preAdmittedAt: Date | null = null;
   let unmappedCount = 0;
+  let returnStartedAt: Date | null = null;
+  let returnedAt: Date | null = null;
 
   for (const ev of ordered) {
     if (!lastEventAt || ev.occurredAt > lastEventAt) lastEventAt = ev.occurredAt;
+
+    /*
+     * THE RETURN LEG NEVER DRIVES THE STATE MACHINE.
+     *
+     * Its events belong to a different tracking code — the parcel's journey
+     * back to us — and every one of them describes that journey in exactly the
+     * words Correos uses for a journey to a customer. "En reparto" on the
+     * return leg is a van bringing the parcel to OUR door; applied the ordinary
+     * way it would read as out for delivery, put the parcel back on a worklist,
+     * and start messaging a customer about a parcel they refused a week ago.
+     * "Entregado" would say the customer has it.
+     *
+     * So the whole leg is taken out of the loop and allowed to say two things
+     * and nothing else, below: the parcel is coming back, or it is back.
+     */
+    if (ev.leg === 'return') {
+      if (ev.mappedState === null) unmappedCount += 1;
+      // The return has at least started. The earliest event on the leg is when
+      // Correos created it, which is the honest "coming back since".
+      if (!returnStartedAt || ev.occurredAt < returnStartedAt) returnStartedAt = ev.occurredAt;
+      /*
+       * `collected` as well as `delivered`. Both mean somebody took it, and on
+       * this leg that somebody is us. Reading only `delivered` would leave a
+       * parcel handed over at a counter stuck in "Coming back" for ever —
+       * which is the exact failure this whole feature exists to end.
+       */
+      if (ev.mappedState === 'delivered' || ev.mappedState === 'collected') {
+        if (!returnedAt || ev.occurredAt > returnedAt) returnedAt = ev.occurredAt;
+      }
+      continue;
+    }
+
     if (ev.eventCode === PRE_ADMISSION_CODE
       && (!preAdmittedAt || ev.occurredAt < preAdmittedAt)) {
       preAdmittedAt = ev.occurredAt;
@@ -112,6 +158,21 @@ export function project(events: readonly ProjectableEvent[]): Projection {
    * the projection keeps the fact (`officeArrivedAt`) and stops deriving a
    * date from it.
    */
+  /*
+   * And now the two things the return leg is allowed to say, applied through
+   * `canTransition` like anything else — so a parcel the operator has already
+   * closed by hand is not reopened by a van.
+   *
+   * Delivered beats started: a leg that has both is a leg that finished.
+   */
+  if (returnedAt) {
+    const next = applyEvent(state, 'returned');
+    if (next !== state) { state = next; stateSince = returnedAt; }
+  } else if (returnStartedAt) {
+    const next = applyEvent(state, 'returning');
+    if (next !== state) { state = next; stateSince = returnStartedAt; }
+  }
+
   return {
     state,
     stateSince,
@@ -121,6 +182,7 @@ export function project(events: readonly ProjectableEvent[]): Projection {
     failedAt,
     lastEventAt,
     preAdmittedAt,
+    returnedAt,
     eventCount: ordered.length,
     unmappedCount,
   };

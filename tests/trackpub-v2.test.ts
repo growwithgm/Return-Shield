@@ -9,7 +9,10 @@ import {
 } from '@/lib/carriers/correos/state-map';
 import { TrackpubClient } from '@/lib/carriers/correos/trackpub';
 import { CorreosTokenProvider } from '@/lib/carriers/correos/token';
-import { REAL_SEARCH_RESPONSE, REAL_CODE, v2Shipment, v2Event } from './helpers/correos';
+import {
+  REAL_SEARCH_RESPONSE, REAL_CODE, RETURN_STARTED_RESPONSE, RETURN_ORIGINAL, RETURN_CODE,
+  v2Shipment, v2Event,
+} from './helpers/correos';
 import { resetDb, closeDb } from './helpers/db';
 import { makeShipment } from './helpers/fixtures';
 
@@ -143,7 +146,42 @@ describe('the real /search response', () => {
     // whole shipment would store a hundred events a hundred times over in a
     // batch — the jsonb column would be the size of the response squared.
     expect(raw.shipment.events).toBeUndefined();
-    expect(raw.shipment.associatedShipments).toBeUndefined();
+  });
+
+  /*
+   * THE FIELD THAT WAS BEING THROWN AWAY.
+   *
+   * `associatedShipments` is the code the parcel comes back under, and it
+   * arrives on the ordinary parcel lookup — nothing extra is asked for. It was
+   * parsed, carried through the normaliser's schema, and then dropped by
+   * `contextOf`'s whitelist, so no parcel in this database had ever reached
+   * `returned`. It is kept now, and the normaliser reports it separately as
+   * well. See lib/carriers/correos/return-code.ts.
+   */
+  it('keeps associatedShipments, which is the code a return travels under', () => {
+    const out = normalisePayload(REAL_SEARCH_RESPONSE, 'poll');
+    const raw = out.events[0].rawPayload as { shipment: Record<string, unknown> };
+
+    expect(raw.shipment.associatedShipments).toEqual([]);
+    // Nothing associated on this parcel: it was never returned.
+    expect(out.associated).toEqual([]);
+  });
+
+  it('reports the return code Correos named, whatever the key is called', () => {
+    const out = normalisePayload(RETURN_STARTED_RESPONSE, 'poll');
+
+    expect(out.associated).toEqual([
+      { code: RETURN_ORIGINAL, associated: [RETURN_CODE] },
+    ]);
+  });
+
+  it('reads the long text, which is the only thing that explains Desestacionado', () => {
+    const out = normalisePayload(RETURN_STARTED_RESPONSE, 'poll');
+    const unheld = out.events.find((e) => e.eventCode === 'M02E340V');
+
+    expect(unheld?.longText).toBe('Envío pendiente de devolución');
+    // And so the event maps, where the word alone would not.
+    expect(unheld?.phase).toBe('SIN FASE');
   });
 
   it('carries the phase through', () => {
@@ -344,6 +382,11 @@ describe('the confirmed event codes', () => {
       'A010000V', 'A090000V', 'G01L010V', 'H01I350V', 'H01R420V', 'H01R421V',
       'L03D045R', 'L03D320R', 'P040000V',
     ]);
+    // `M02E340V` and `M02E360V` ("Desestacionado") are still NOT here, and
+    // that is the point of the new rule: the word means two opposite things
+    // and only Correos' long text settles which, so the code alone maps to
+    // nothing. See tests/wordings.test.ts.
+    expect(knownCodes()).not.toContain('M02E340V');
   });
 
   it.each([

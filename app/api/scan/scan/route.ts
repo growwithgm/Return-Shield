@@ -57,6 +57,18 @@ export async function POST(req: Request): Promise<NextResponse> {
     item: answer.item,
     duplicate: answer.duplicate,
     counted: answer.counted,
+    /*
+     * "This pile may be going the other way."
+     *
+     * Still a 200 and the scan is stored, which is the whole point: a parcel
+     * is never lost to a warning. The phone turns a run of these into the
+     * offer to switch the batch — see lib/scan/direction.ts and the sticky
+     * banner in components/scan/ScannerApp.tsx.
+     *
+     * It carries a state word and nothing else. No name, no phone, no
+     * address, no value; the rule above still holds.
+     */
+    ...(answer.doubt ? { doubt: answer.doubt } : {}),
   });
 }
 

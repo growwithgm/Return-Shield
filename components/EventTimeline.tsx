@@ -14,6 +14,16 @@ export interface TimelineEvent {
   exact: string;
   source: string;
   first: boolean;
+  /**
+   * The code this event arrived under, when it is NOT the parcel's own.
+   *
+   * Set for every event on the return leg, and null for everything else. It is
+   * what stops the timeline lying: Correos describe a van bringing a parcel
+   * back to our warehouse in exactly the words they use for a van taking one
+   * to a customer, so an unmarked "En reparto" or "Entregado" on this list
+   * would be read as the customer's and said to them on the phone.
+   */
+  returnCode?: string | null;
 }
 
 /**
@@ -30,6 +40,12 @@ export interface TimelineEvent {
  *
  * An event we have never seen before is shown too, marked as not recognised,
  * rather than hidden — a gap in the timeline is worse than an unfamiliar line.
+ *
+ * ONE PARCEL, ONE TIMELINE, BOTH JOURNEYS. The events of the return travel
+ * under a second tracking code and are shown here with the rest, because it is
+ * the same box and the operator should not have to look in two places for it.
+ * Each one carries "Return · DX…" so it can never be mistaken for progress
+ * towards the customer — see `returnCode` above.
  */
 export function EventTimeline({ events, tone }: { events: TimelineEvent[]; tone: Tone }) {
   if (!events.length) {
@@ -71,6 +87,15 @@ export function EventTimeline({ events, tone }: { events: TimelineEvent[]; tone:
             )}
             <div className="mt-[2px] text-[11.5px] italic leading-[1.4] text-muted">{e.desc}</div>
             <div className="mt-[5px] flex flex-wrap items-center gap-[7px]">
+              {e.returnCode && (
+                <span
+                  className="inline-block rounded-[3px] border px-[7px] py-[2px] font-mono text-[10px] font-semibold"
+                  style={{ borderColor: 'var(--navy)', color: 'var(--navy)' }}
+                  title="This event is the parcel coming back to us, under the code Correos gave the return. It says nothing about the customer."
+                >
+                  Return · {e.returnCode}
+                </span>
+              )}
               <span className={e.source.startsWith('Found')
                 ? 'inline-block rounded-[3px] border border-dashed border-muted px-[7px] py-[2px] text-[10px] font-medium text-muted'
                 : 'text-[10.5px] font-medium text-muted'}>

@@ -43,7 +43,10 @@ const EventSchema = loose.extend({
   // ("Admitido."); `expandedText` is its longer sibling and stands in when the
   // summary is missing.
   summaryText: z.string().nullish(),
+  // `expandedText` is trackpub's spelling; their public tracker sends the same
+  // field as `extendedText`. Both, because the long text is now read.
   expandedText: z.string().nullish(),
+  extendedText: z.string().nullish(),
   desEvento: z.string().nullish(),
   descripcionEvento: z.string().nullish(),
   eventDescription: z.string().nullish(),
@@ -95,6 +98,13 @@ const ShipmentSchema = loose.extend({
   reference1: z.unknown().optional(),
   reference3: z.unknown().optional(),
   expeditionCode: z.unknown().optional(),
+  /**
+   * The other code this parcel travels under — the return.
+   *
+   * Correos send it on the lookup and nothing here read it, so every return in
+   * the system was invisible. See `associatedCodesOf`.
+   */
+  associatedShipments: z.unknown().optional(),
   deliveryDate: z.unknown().optional(),
   dateExpiration: z.unknown().optional(),
   dateCalculated: z.unknown().optional(),
@@ -118,8 +128,22 @@ export interface ShipmentError {
   desError: string;
 }
 
+/** A tracking code, and the other codes Correos said belong with it. */
+export interface AssociatedShipments {
+  code: string;
+  associated: string[];
+}
+
 export interface NormaliseOutcome {
   events: IncomingEvent[];
+  /**
+   * The other codes Correos named for each shipment they answered about.
+   *
+   * This is where a return code comes from when they tell us one, which is the
+   * answer we prefer over working it out. Empty for the great majority of
+   * parcels: a shipment only gets an associated code once a return exists.
+   */
+  associated: AssociatedShipments[];
   /** Things we could not read. Kept so a human can look at them. */
   problems: string[];
   /**
@@ -149,6 +173,7 @@ export function normalisePayload(
   if (!parsed.success) {
     return {
       events: [],
+      associated: [],
       problems: ['payload did not look like a Correos tracking body'],
       errors: [],
       codesSeen: [],
@@ -157,6 +182,7 @@ export function normalisePayload(
 
   const shipments = collectShipments(parsed.data);
   const events: IncomingEvent[] = [];
+  const associated: AssociatedShipments[] = [];
   const problems: string[] = [];
   const errors: ShipmentError[] = [];
   const codesSeen = new Set<string>();
@@ -190,11 +216,25 @@ export function normalisePayload(
     // copying it onto each event would store a hundred events a hundred times.
     const shipmentContext = contextOf(s);
 
+    const related = associatedCodesOf(s);
+    if (related.length) associated.push({ code: shippingCode, associated: related });
+
     for (const e of list) {
       const desc = firstString(
-        e.summaryText, e.desEvento, e.descripcionEvento, e.eventDescription, e.expandedText,
+        e.summaryText, e.desEvento, e.descripcionEvento, e.eventDescription,
+        e.expandedText, e.extendedText,
       )?.trim();
       if (!desc) { problems.push(`${shippingCode}: an event with no description`); continue; }
+
+      /*
+       * The long text, when it is not simply the description over again.
+       *
+       * Both spellings, because the two feeds disagree: trackpub sends
+       * `expandedText` and their public tracker `extendedText`. It is read by
+       * exactly one rule — "Desestacionado" plus "Envío pendiente de
+       * devolución" is a return starting — and kept on the event for the rest.
+       */
+      const longText = firstString(e.expandedText, e.extendedText)?.trim() ?? null;
 
       const occurredAt = parseCorreosMoment(
         firstString(e.fecEvento, e.fechaEvento, e.eventDate),
@@ -215,6 +255,7 @@ export function normalisePayload(
         eventCode,
         eventDesc: desc,
         phase: firstString(e.phaseDes, e.phase) ?? null,
+        longText: longText && longText !== desc ? longText : null,
         occurredAt,
         source,
         officeCode: office.code,
@@ -225,7 +266,7 @@ export function normalisePayload(
     }
   }
 
-  return { events, problems, errors, codesSeen: [...codesSeen] };
+  return { events, associated, problems, errors, codesSeen: [...codesSeen] };
 }
 
 /**
@@ -236,7 +277,7 @@ export function normalisePayload(
  * point of the queue is to collect the codes and wordings we do not have yet.
  */
 export function unmappedIn(outcome: NormaliseOutcome): IncomingEvent[] {
-  return outcome.events.filter((e) => needsReview(e.eventCode, e.eventDesc, e.phase));
+  return outcome.events.filter((e) => needsReview(e.eventCode, e.eventDesc, e.phase, e.longText));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -277,11 +318,65 @@ function officeOf(e: { [k: string]: unknown }): {
   };
 }
 
-/** The shipment-level fields worth keeping, for later. Nothing reads these. */
+/**
+ * The other tracking codes Correos named on this shipment.
+ *
+ * THIS IS THE FIELD THAT WAS BEING THROWN AWAY. Their lookup answers a return
+ * with `associatedShipments: [{ shipmentCode: "DXA6TP9800129340128012S" }]`,
+ * and `contextOf` kept a fixed list that did not include it — so the one place
+ * Correos tell us a parcel is coming back under another code went straight in
+ * the bin, and the system never had a return leg to follow.
+ *
+ * Every key whose NAME says "associated" is read, rather than one spelling,
+ * because the two feeds have never agreed on a field name yet and the cost of
+ * missing this one is a parcel that silently never comes home. The values are
+ * taken apart defensively: a string, a list of strings, or a list of objects
+ * with a code-ish field, which covers every shape seen so far and ignores
+ * anything else rather than throwing.
+ */
+export function associatedCodesOf(shipment: unknown): string[] {
+  if (!shipment || typeof shipment !== 'object') return [];
+  const out = new Set<string>();
+
+  for (const [key, value] of Object.entries(shipment as Record<string, unknown>)) {
+    if (!/assoc|asociad/i.test(key)) continue;
+    for (const code of codesIn(value)) out.add(code);
+  }
+
+  return [...out];
+}
+
+/** Tracking codes inside whatever shape Correos put them in. */
+function codesIn(value: unknown): string[] {
+  if (typeof value === 'string') {
+    const code = value.trim().toUpperCase();
+    return LOOKS_LIKE_A_CODE.test(code) ? [code] : [];
+  }
+  if (Array.isArray(value)) return value.flatMap(codesIn);
+  if (value && typeof value === 'object') {
+    // Only code-ish keys, so a date or a description cannot be mistaken for a
+    // tracking number by looking vaguely like one.
+    return Object.entries(value as Record<string, unknown>)
+      .filter(([k]) => /code|codigo|envio|shipment/i.test(k))
+      .flatMap(([, v]) => codesIn(v));
+  }
+  return [];
+}
+
+/** Correos' tracking codes: letters and digits, roughly this long. */
+const LOOKS_LIKE_A_CODE = /^[A-Z0-9]{13,30}$/;
+
+/**
+ * The shipment-level fields worth keeping, for later.
+ *
+ * `associatedShipments` is read — it is the return code — and the rest are
+ * still only kept. The comment used to say nothing read any of them, which was
+ * true until a parcel came back.
+ */
 function contextOf(s: LooseShipment): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of [
-    'reference1', 'reference3', 'expeditionCode',
+    'reference1', 'reference3', 'expeditionCode', 'associatedShipments',
     'deliveryDate', 'dateExpiration', 'dateCalculated', 'weight',
   ] as const) {
     const value = (s as Record<string, unknown>)[key];

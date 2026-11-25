@@ -173,7 +173,10 @@ describe('the incoming badge', () => {
 
 describe('the Returns tab', () => {
   it('puts each scan in the right section', async () => {
-    await makeShipment({ shippingCode: CODE, orderNumber: '#22709', storeName: 'Don Cabello Profesional' });
+    await makeShipment({
+      shippingCode: CODE, orderNumber: '#22709', storeName: 'Don Cabello Profesional',
+      state: 'returning',
+    });
 
     await makeScan({ code: BULTO, userId: worker, direction: 'incoming', at: clock.now() });
     await makeScan({
@@ -183,16 +186,127 @@ describe('the Returns tab', () => {
     const view = await returnsView({ at: clock.now() });
 
     expect(view.mineTotal).toBe(1);
+    expect(view.checkTotal).toBe(0);
     expect(view.theirsTotal).toBe(1);
     expect(view.mine[0].label).toEqual({ lead: '#22709', note: 'Don Cabello Profesional' });
     expect(view.mine[0].shipmentId).not.toBeNull();
     expect(view.theirs[0].base).toBe('PKA6TP980010999');
-    // The sections add up to the number on the tab.
-    expect(view.mineTotal + view.theirsTotal).toBe(await returnsCount(clock.now()));
+    // The sections add up to the number on the tab. They do so by
+    // construction now — the count runs the same CTE — rather than by two
+    // queries happening to agree.
+    expect(view.mineTotal + view.checkTotal + view.theirsTotal)
+      .toBe(await returnsCount(clock.now()));
+  });
+
+  /*
+   * THE 20 AND 25 NOVEMBER PILES.
+   *
+   * Fifty-two parcels scanned in Incoming mode in thirty-eight minutes while
+   * Correos had them out for delivery, and thirty more a few days later, every
+   * one of them Pre-admisión. They read "Back in the warehouse" on a screen
+   * the office trusts. They are still shown — a scan is a person saying they
+   * held the box, and the system does not get to overrule that — but under a
+   * heading that says what is doubtful about them, with the reason named.
+   */
+  it('questions a parcel Correos says is still on its way out', async () => {
+    await makeShipment({ shippingCode: CODE, orderNumber: '#22709', state: 'out_for_delivery' });
+    await makeScan({ code: BULTO, userId: worker, direction: 'incoming', at: clock.now() });
+
+    const view = await returnsView({ at: clock.now() });
+
+    expect(view.mineTotal).toBe(0);
+    expect(view.checkTotal).toBe(1);
+    expect(view.check[0].doubt).toBe('Correos says this parcel is out for delivery to the customer.');
+    // And it carries what the button needs to move it.
+    expect(view.check[0].batchId).toBeTruthy();
+    expect(view.check[0].batchSize).toBe(1);
+  });
+
+  it('questions a Pre-admisión parcel too: it was never even posted', async () => {
+    await makeShipment({ shippingCode: CODE, state: 'created' });
+    await makeScan({ code: BULTO, userId: worker, direction: 'incoming', at: clock.now() });
+
+    const view = await returnsView({ at: clock.now() });
+    expect(view.checkTotal).toBe(1);
+    expect(view.check[0].doubt).toBe('Correos says this parcel has not been handed to Correos yet.');
+  });
+
+  /*
+   * And the states it must NOT question. A parcel whose delivery failed, or
+   * that is sitting at a post office, may well be on its way back before
+   * Correos says so — eighteen of the eighty-seven returns were still
+   * travelling when the operator counted them. Scanning one in is EARLY, not
+   * wrong, and a section that cried wolf about those would be ignored.
+   */
+  it.each(['failed', 'at_office', 'bad_address'] as const)(
+    'does not question a parcel in %s: coming back early is not wrong',
+    async (state) => {
+      await makeShipment({ shippingCode: CODE, state });
+      await makeScan({ code: BULTO, userId: worker, direction: 'incoming', at: clock.now() });
+
+      const view = await returnsView({ at: clock.now() });
+      expect(view.checkTotal).toBe(0);
+      expect(view.mineTotal).toBe(1);
+      expect(view.mine[0].doubt).toBeNull();
+    },
+  );
+
+  /*
+   * THE FIVE REAL RETURNS OF 27 OCTOBER, which were filed as strangers.
+   *
+   * A return travels under a code of Correos' own — same core, `DX` prefix —
+   * and the fifteen characters this system matched on are PREFIX plus core, so
+   * a DX label matched nothing at all. Now it names its parcel, and the label
+   * itself is enough to put the row under "Back with us": Correos only ever
+   * print that code for the journey home.
+   */
+  it('matches a DX return label to its parcel, with no Correos event at all', async () => {
+    await makeShipment({
+      shippingCode: 'PKA6TP9800129340147006H',
+      orderNumber: '576982410859617218',
+      storeName: 'TikTok Shop ES',
+      platform: 'tiktok',
+      // Deliberately a state that would otherwise be questioned: the label is
+      // the stronger signal and has to win.
+      state: 'out_for_delivery',
+    });
+    await makeScan({
+      code: 'DXA6TP9800129340128012S', userId: worker, direction: 'incoming', at: clock.now(),
+    });
+
+    const view = await returnsView({ at: clock.now() });
+
+    expect(view.checkTotal).toBe(0);
+    expect(view.mineTotal).toBe(1);
+    expect(view.mine[0].viaReturn).toBe(true);
+    expect(view.mine[0].shipmentId).not.toBeNull();
+    // The code as read, not its base: DXA6TP980012934 is useful to nobody.
+    expect(view.mine[0].code).toBe('DXA6TP9800129340128012S');
+  });
+
+  it('counts one return when the same parcel was scanned on both of its labels', async () => {
+    /*
+     * The two labels have DIFFERENT fifteen-character bases —
+     * PKA6TP980012934 and DXA6TP980012934 — so keying the list on the base
+     * showed one return as two lines about one order.
+     */
+    await makeShipment({ shippingCode: 'PKA6TP9800129340147006H', state: 'returning' });
+    await makeScan({
+      code: 'PKA6TP9800129340147006H', userId: worker, direction: 'incoming', at: clock.now(),
+    });
+    clock.advanceHours(1);
+    await makeScan({
+      code: 'DXA6TP9800129340128012S', userId: worker, direction: 'incoming', at: clock.now(),
+    });
+
+    const view = await returnsView({ at: clock.now() });
+    expect(view.mineTotal).toBe(1);
+    expect(view.mineTotal + view.checkTotal + view.theirsTotal)
+      .toBe(await returnsCount(clock.now()));
   });
 
   it('shows a parcel once when it was scanned in two batches', async () => {
-    await makeShipment({ shippingCode: CODE, orderNumber: '#22709' });
+    await makeShipment({ shippingCode: CODE, orderNumber: '#22709', state: 'returning' });
     await makeScan({ code: BULTO, userId: worker, direction: 'incoming', at: clock.now() });
 
     const second = (await makeUser({ role: 'scanner', name: 'Jon' })).id;
@@ -206,7 +320,7 @@ describe('the Returns tab', () => {
   });
 
   it('shows when it left the warehouse, if the warehouse ever scanned it out', async () => {
-    await makeShipment({ shippingCode: CODE });
+    await makeShipment({ shippingCode: CODE, state: 'returning' });
     await makeScan({ code: BULTO, userId: worker, direction: 'outgoing', at: clock.now() });
 
     clock.advanceDays(9);
@@ -225,7 +339,10 @@ describe('the Returns tab', () => {
      * its own ninety days. It must not jump sections: the order number was
      * copied onto it when it was scanned, for exactly this.
      */
-    const parcel = await makeShipment({ shippingCode: CODE, orderNumber: '#22709', storeName: 'Don Cabello Profesional' });
+    const parcel = await makeShipment({
+      shippingCode: CODE, orderNumber: '#22709', storeName: 'Don Cabello Profesional',
+      state: 'returning',
+    });
     await makeScan({
       code: BULTO,
       userId: worker,
@@ -261,6 +378,52 @@ describe('the Returns tab', () => {
     await makeScan({ code: BULTO, userId: worker, direction: 'outgoing', at: clock.now() });
 
     const view = await returnsView({ at: clock.now() });
-    expect(view.mineTotal + view.theirsTotal).toBe(0);
+    expect(view.mineTotal + view.checkTotal + view.theirsTotal).toBe(0);
+    expect(view.awaitedTotal).toBe(0);
+  });
+
+  /*
+   * THE SIXTY-NINE NOBODY COULD SEE.
+   *
+   * Correos delivered the return to our door and the warehouse never scanned
+   * it in. This screen was built entirely out of scans, so there was nothing
+   * to show — a parcel could be back in the building for a month with no row
+   * anywhere saying so. It is read from the parcel instead.
+   */
+  it('lists a parcel Correos brought back that nobody scanned in', async () => {
+    await makeShipment({
+      shippingCode: 'PKA6TP9800129340147006H',
+      orderNumber: '576982410859617218',
+      state: 'returned',
+      returnCode: 'DXA6TP9800129340128012S',
+      returnCodeSource: 'correos',
+      returnedAt: clock.now(),
+    });
+
+    const view = await returnsView({ at: clock.now() });
+
+    expect(view.awaitedTotal).toBe(1);
+    expect(view.awaited[0].returnCode).toBe('DXA6TP9800129340128012S');
+    expect(view.awaited[0].returnCodeSource).toBe('correos');
+    expect(view.awaited[0].orderNumber).toBe('576982410859617218');
+    // And no scan-built section claims it, because there is no scan.
+    expect(view.mineTotal + view.checkTotal + view.theirsTotal).toBe(0);
+  });
+
+  it('drops it off that list the moment either label is scanned in', async () => {
+    await makeShipment({
+      shippingCode: 'PKA6TP9800129340147006H',
+      state: 'returned',
+      returnCode: 'DXA6TP9800129340128012S',
+      returnCodeSource: 'correos',
+      returnedAt: clock.now(),
+    });
+    await makeScan({
+      code: 'DXA6TP9800129340128012S', userId: worker, direction: 'incoming', at: clock.now(),
+    });
+
+    const view = await returnsView({ at: clock.now() });
+    expect(view.awaitedTotal).toBe(0);
+    expect(view.mineTotal).toBe(1);
   });
 });

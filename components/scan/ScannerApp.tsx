@@ -3,10 +3,13 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { parseCorreosCode, type CorreosCode } from '@/lib/scan/codes';
+import {
+  DOUBT_RUN, doubtFromCode, type DirectionDoubt, type DirectionVerdict,
+} from '@/lib/scan/direction';
 import { summarise, type Batch, type ScanItem } from '@/lib/scan/items';
 import { DIRECTION_LABEL, type ScanDirection, type ScanSource } from '@/lib/scan/model';
 import { SCAN_BOX, useScanner } from './useScanner';
-import { beepDuplicate, beepSaved, unlockAudio } from './feedback';
+import { beepDuplicate, beepSaved, beepWrongWay, unlockAudio } from './feedback';
 import { adoptBatch, countTry, forgetRead, pendingReads, queueRead, type Outgoing } from './outbox';
 import { BatchList, madridTime, type DisplayRow, type RemoveTarget } from './BatchList';
 import { TypeSheet } from './TypeSheet';
@@ -47,7 +50,29 @@ const JUST_NOW_MS = 4_000;
 /** How often the queue is retried while anything is waiting. */
 const RETRY_MS = 3_000;
 
-type Flash = { kind: 'saved' | 'duplicate'; base: string; at: number };
+/*
+ * A THIRD KIND OF BANNER, and it is not a flash.
+ *
+ * `saved` and `duplicate` live for 1.2 seconds, which is right for "carry on
+ * scanning". A wrong-direction warning is something the worker has to ACT on —
+ * switch the batch, or confirm the parcel really came back — so it stays until
+ * they answer it. On 20 November fifty-two outgoing parcels went into an
+ * Incoming batch in thirty-eight minutes, every one of them beeping "saved";
+ * a warning that disappears before the next parcel is picked up would have
+ * changed nothing.
+ */
+type Flash = { kind: 'saved' | 'duplicate' | 'wrong-way'; base: string; at: number };
+
+/** The open question: this pile may be going the other way. */
+type Doubt = {
+  kind: DirectionDoubt;
+  message: string;
+  shouldBe: ScanDirection;
+  /** The code that raised it, so the worker can see which parcel. */
+  code: string;
+  /** How many in a row have looked like this. See DOUBT_RUN. */
+  run: number;
+};
 
 export function ScannerApp({
   direction,
@@ -77,6 +102,16 @@ export function ScannerApp({
   const [signedOut, setSignedOut] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [finishing, setFinishing] = useState(false);
+  /**
+   * The wrong-direction question, and the run that led to it.
+   *
+   * Sticky: cleared only when the worker answers it, or when the batch is
+   * finished. `run` counts consecutive doubtful reads and is reset by any
+   * read the server was happy with, so three in a row really is a pile and
+   * not three parcels scattered through a good one.
+   */
+  const [doubt, setDoubt] = useState<Doubt | null>(null);
+  const doubtRun = useRef(0);
 
   // Refs for the things the flush loop and the decode loop read. Both run
   // outside React's render, and both must see the latest value rather than the
@@ -180,9 +215,30 @@ export function ScannerApp({
           return;
         }
 
-        const body = await res.json() as { item: ScanItem };
+        const body = await res.json() as { item: ScanItem; doubt?: DirectionVerdict };
         upsert(body.item);
         await forgetRead(read.readId);
+
+        /*
+         * "Correos says this parcel is still on its way out."
+         *
+         * Only the server can reach this verdict — it needs the parcel's state,
+         * which the phone does not have — so it arrives here rather than in
+         * `take`, possibly a parcel or two later. That is why it is a sticky
+         * banner naming its own code rather than a flash: by the time it gets
+         * here the 1.2-second flash would be over, and flashing it now would
+         * flash it over an unrelated parcel.
+         */
+        if (body.doubt) {
+          doubtRun.current += 1;
+          const run = doubtRun.current;
+          setDoubt({ ...body.doubt, code: body.item.codeAsRead, run });
+          if (run === 1) beepWrongWay();
+        } else {
+          // A read the server was happy with breaks the run: three in a row is
+          // a pile, three scattered through sixty is not.
+          doubtRun.current = 0;
+        }
       }
     } finally {
       flushing.current = false;
@@ -224,12 +280,70 @@ export function ScannerApp({
     await queueRead(read);
     setQueue(await pendingReads(direction));
 
-    if (already) beepDuplicate(); else beepSaved();
-    setFlash({ kind: already ? 'duplicate' : 'saved', base: code.base, at: Date.now() });
+    /*
+     * The one verdict the code alone settles, reached before the read has even
+     * been sent: a DX return label in an Outgoing batch. That is the only
+     * moment a warning can reach the worker while the parcel is still in their
+     * hand, and it needs no lookup to be certain of.
+     *
+     * The other direction — an ordinary label in an Incoming batch — is NOT
+     * decided here, on purpose. Scanning one is perfectly normal; what is not
+     * is scanning in a parcel Correos still has out for delivery, and only the
+     * server knows that. See lib/scan/direction.ts.
+     */
+    const instant = doubtFromCode(code, direction);
+
+    if (instant) {
+      beepWrongWay();
+      setFlash({ kind: 'wrong-way', base: code.base, at: Date.now() });
+      doubtRun.current += 1;
+      setDoubt({ ...instant, code: code.raw, run: doubtRun.current });
+    } else if (already) {
+      beepDuplicate();
+      setFlash({ kind: 'duplicate', base: code.base, at: Date.now() });
+    } else {
+      beepSaved();
+      setFlash({ kind: 'saved', base: code.base, at: Date.now() });
+    }
 
     // 3. On its way. The queue owns the retrying.
     void flush();
   }, [direction, flush]);
+
+  /**
+   * "Switch this batch to Outgoing" — the whole pile, not just this parcel.
+   *
+   * Offered once three reads in a row have looked wrong, because one is a
+   * parcel and three is a pile. The two wrong-mode batches were fifty-two and
+   * thirty labels long, so a worker who is told after three has twenty-seven
+   * left to save and the twenty-five already taken get fixed by the same press.
+   */
+  const switchBatch = useCallback(async (to: ScanDirection) => {
+    const id = batchIdRef.current;
+    if (!id) return;
+    setDoubt(null);
+    doubtRun.current = 0;
+    try {
+      const res = await fetch('/api/scan/batch', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchId: id, direction: to }),
+      });
+      if (res.status === 401) { setSignedOut(true); return; }
+      if (!res.ok) {
+        setProblem('The batch could not be switched. Tell the office which pile this is.');
+        return;
+      }
+      /*
+       * Off to the other mode, which is a page of its own: `direction` is a
+       * prop of this component and the batch has just stopped being this
+       * mode's. The scans came with it.
+       */
+      window.location.href = `/scan/${to}`;
+    } catch {
+      setProblem('The batch could not be switched. Tell the office which pile this is.');
+    }
+  }, []);
 
   const onCode = useCallback((code: CorreosCode) => { void take(code, 'barcode'); }, [take]);
   const camera = useScanner(onCode);
@@ -260,7 +374,11 @@ export function ScannerApp({
 
   useEffect(() => {
     if (!flash) return undefined;
-    const timer = setTimeout(() => setFlash(null), FLASH_MS);
+    // A wrong-way banner outlives the flash window: the sticky `doubt` panel
+    // below is what the worker answers, and the big orange edge has to stay up
+    // with it rather than go green again after 1.2 seconds.
+    const ms = flash.kind === 'wrong-way' ? FLASH_MS * 3 : FLASH_MS;
+    const timer = setTimeout(() => setFlash(null), ms);
     return () => clearTimeout(timer);
   }, [flash]);
 
@@ -447,9 +565,11 @@ export function ScannerApp({
           <span
             className="h-[10px] w-[10px] flex-none rounded-full"
             style={{
-              background: flash?.kind === 'duplicate'
+              background: flash?.kind === 'wrong-way'
                 ? 'var(--warn)'
-                : flash?.kind === 'saved' ? 'var(--good)' : 'var(--crit)',
+                : flash?.kind === 'duplicate'
+                  ? 'var(--warn)'
+                  : flash?.kind === 'saved' ? 'var(--good)' : 'var(--crit)',
               boxShadow: '0 0 0 4px rgba(90,100,120,.16)',
             }}
           />
@@ -457,24 +577,30 @@ export function ScannerApp({
             <span
               className="text-[15px] font-semibold"
               style={{
-                color: flash?.kind === 'duplicate'
+                color: flash?.kind === 'wrong-way'
                   ? 'var(--warn)'
-                  : flash?.kind === 'saved' ? 'var(--good)' : 'var(--ink)',
+                  : flash?.kind === 'duplicate'
+                    ? 'var(--warn)'
+                    : flash?.kind === 'saved' ? 'var(--good)' : 'var(--ink)',
               }}
             >
-              {flash?.kind === 'duplicate'
-                ? 'Already in this batch'
-                : flash?.kind === 'saved'
-                  ? 'Beep · saved'
-                  : outgoing ? 'Scanning' : 'Scanning incoming'}
+              {flash?.kind === 'wrong-way'
+                ? 'Saved — but check the direction'
+                : flash?.kind === 'duplicate'
+                  ? 'Already in this batch'
+                  : flash?.kind === 'saved'
+                    ? 'Beep · saved'
+                    : outgoing ? 'Scanning' : 'Scanning incoming'}
             </span>
             <span className="text-[13px] text-muted">
               {queue.length
                 ? `Sending ${queue.length}…`
                 : flash
-                  ? flash.kind === 'duplicate'
-                    ? 'Not added again'
-                    : 'The next scan starts by itself'
+                  ? flash.kind === 'wrong-way'
+                    ? 'It is stored either way — read the orange box'
+                    : flash.kind === 'duplicate'
+                      ? 'Not added again'
+                      : 'The next scan starts by itself'
                   : 'Hold still until the beep'}
             </span>
           </span>
@@ -496,6 +622,63 @@ export function ScannerApp({
         >
           <span className="mt-[2px] flex-none text-crit"><WarnIcon /></span>
           <span className="text-[13px] leading-[1.45] text-crit">{problem}</span>
+        </div>
+      )}
+
+      {/*
+        * THE PILE MAY BE GOING THE OTHER WAY.
+        *
+        * Orange, not red, and it stays until it is answered. The parcel IS
+        * saved — that is said first, because the worker's instinct on seeing a
+        * warning is to scan it again, and a second read of the same label is
+        * the one thing that cannot help.
+        *
+        * Two buttons and no cancel: either the pile is going out, or it really
+        * came back. Both are one tap, and both are honest about what they do.
+        */}
+      {doubt && (
+        <div
+          role="alert"
+          className="mx-4 mt-3 rounded-[10px] border-2 border-warn bg-warnsoft px-[14px] py-3"
+        >
+          <div className="flex items-start gap-3">
+            <span className="mt-[2px] flex-none text-warn"><WarnIcon /></span>
+            <div className="min-w-0">
+              <div className="text-[15px] font-bold text-warn">
+                {doubt.kind === 'return-in-outgoing'
+                  ? 'This is a return label'
+                  : 'Is this pile going the other way?'}
+              </div>
+              <div className="mt-[2px] font-mono text-[12px] text-muted">{doubt.code}</div>
+              <div className="mt-1 text-[13px] leading-[1.45] text-ink">
+                {doubt.message} It is saved either way — do not scan it again.
+              </div>
+              {doubt.run >= DOUBT_RUN && (
+                <div className="mt-1 text-[13px] font-semibold leading-[1.45] text-warn">
+                  {`That is ${doubt.run} in a row. This looks like a whole pile in the wrong mode.`}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => { void switchBatch(doubt.shouldBe); }}
+              className="h-11 flex-1 rounded-[10px] bg-navy px-3 text-[14px] font-semibold text-white"
+            >
+              {doubt.shouldBe === 'outgoing'
+                ? 'Switch this batch to Outgoing'
+                : 'Switch this batch to Incoming'}
+            </button>
+            <button
+              type="button"
+              onClick={() => { setDoubt(null); doubtRun.current = 0; }}
+              className="h-11 flex-1 rounded-[10px] border border-line bg-surface px-3 text-[14px] font-semibold text-navy"
+            >
+              {doubt.shouldBe === 'outgoing' ? 'It really came back' : 'It really went out'}
+            </button>
+          </div>
         </div>
       )}
 
@@ -564,10 +747,17 @@ function CameraPanel({
   camera: ReturnType<typeof useScanner>;
   flash: Flash | null;
 }) {
-  const edge = flash?.kind === 'duplicate'
+  /*
+   * Three kinds now, and a THIRD BRANCH IS NEEDED AT EVERY SITE: each of these
+   * reads was a two-branch ternary falling through to the neutral style, so a
+   * kind added only to the type would render as "Scanning" with a white edge
+   * and no card — a warning nobody sees.
+   */
+  const wrong = flash?.kind === 'wrong-way';
+  const edge = wrong || flash?.kind === 'duplicate'
     ? 'var(--warn)'
     : flash?.kind === 'saved' ? 'var(--good)' : 'rgba(255,255,255,.75)';
-  const line = flash?.kind === 'duplicate'
+  const line = wrong || flash?.kind === 'duplicate'
     ? 'var(--warn)'
     : flash?.kind === 'saved' ? 'var(--good)' : 'var(--crit)';
 
@@ -604,20 +794,22 @@ function CameraPanel({
         <div
           role="status"
           className="absolute left-3 right-[68px] top-3 flex flex-col gap-2 rounded-[12px] px-3 pb-3 pt-[10px] shadow-card"
-          style={flash.kind === 'duplicate'
-            ? { background: 'var(--warn)', color: '#fff' }
-            : { background: 'var(--good)', color: '#fff' }}
+          style={flash.kind === 'saved'
+            ? { background: 'var(--good)', color: '#fff' }
+            : { background: 'var(--warn)', color: '#fff' }}
         >
           <div className="flex items-center gap-[10px]">
             <span
               className="grid h-[30px] w-[30px] flex-none place-items-center rounded-full bg-white"
-              style={{ color: flash.kind === 'duplicate' ? 'var(--warn)' : 'var(--good)' }}
+              style={{ color: flash.kind === 'saved' ? 'var(--good)' : 'var(--warn)' }}
             >
-              {flash.kind === 'duplicate' ? <WarnIcon size={18} /> : <TickIcon />}
+              {flash.kind === 'saved' ? <TickIcon /> : <WarnIcon size={18} />}
             </span>
             <span className="flex min-w-0 flex-col">
               <span className="text-[17px] font-bold leading-[1.2]">
-                {flash.kind === 'duplicate' ? 'Already in this batch' : 'Scanned'}
+                {flash.kind === 'wrong-way'
+                  ? 'Saved · wrong way round?'
+                  : flash.kind === 'duplicate' ? 'Already in this batch' : 'Scanned'}
               </span>
               <span className="font-mono text-[14px] leading-[1.3]">{flash.base}</span>
             </span>
@@ -664,16 +856,18 @@ function CameraPanel({
         <p
           className="absolute bottom-[18px] left-4 right-4 m-0 text-center text-[14px] font-semibold leading-[1.4]"
           style={{
-            color: flash?.kind === 'duplicate'
+            color: wrong || flash?.kind === 'duplicate'
               ? 'var(--accent)'
               : flash?.kind === 'saved' ? 'var(--goodsoft)' : '#E5E9F0',
           }}
         >
-          {flash?.kind === 'duplicate'
-            ? 'Not added again. Move to the next parcel'
-            : flash?.kind === 'saved'
-              ? 'Saved. Move to the next parcel'
-              : camera.status === 'starting' ? 'Opening the camera…' : 'Fill the box with the barcode'}
+          {flash?.kind === 'wrong-way'
+            ? 'Saved. Read the orange box below'
+            : flash?.kind === 'duplicate'
+              ? 'Not added again. Move to the next parcel'
+              : flash?.kind === 'saved'
+                ? 'Saved. Move to the next parcel'
+                : camera.status === 'starting' ? 'Opening the camera…' : 'Fill the box with the barcode'}
         </p>
       )}
     </div>

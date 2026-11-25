@@ -26,6 +26,19 @@ import { displayPhone } from '@/lib/import/phone';
 
 export interface ShipmentRow extends DecidableShipment {
   shippingCode: string;
+  /**
+   * The code the parcel comes back under, once it is coming back.
+   *
+   * Null for the great majority of parcels, which never do. It is here rather
+   * than looked up per screen because three places need it: the timeline marks
+   * the return leg's events with it, the Returns tab matches a `DX` label to
+   * its order with it, and the operator types it into Correos' own tracker.
+   */
+  returnCode: string | null;
+  /** Whether Correos named it or we worked it out. See return-code.ts. */
+  returnCodeSource: string | null;
+  /** When Correos delivered the return back to US. */
+  returnedAt: Date | null;
   orderNumber: string;
   storeName: string;
   phoneE164: string | null;
@@ -90,6 +103,9 @@ async function loadRowsQuery(opts: { at?: Date } = {}): Promise<ShipmentRow[]> {
     id: shipments.id,
     state: shipments.state,
     shippingCode: shipments.shippingCode,
+    returnCode: shipments.returnCode,
+    returnCodeSource: shipments.returnCodeSource,
+    returnedAt: shipments.returnedAt,
     officeArrivedAt: shipments.officeArrivedAt,
     lastEventAt: shipments.lastEventAt,
     mutedUntil: shipments.mutedUntil,
@@ -193,6 +209,9 @@ async function loadRowsQuery(opts: { at?: Date } = {}): Promise<ShipmentRow[]> {
     return {
       ...base,
       shippingCode: r.shippingCode,
+      returnCode: r.returnCode,
+      returnCodeSource: r.returnCodeSource,
+      returnedAt: r.returnedAt,
       orderNumber: r.orderNumber,
       storeName: r.storeName,
       phoneE164: r.phoneE164,

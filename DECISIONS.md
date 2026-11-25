@@ -1595,6 +1595,211 @@ database so the dashboard and the worker agree about what time it is.
 
 ---
 
+### A return travels under a second code, and the system now follows it
+
+This is the biggest thing the system had wrong, and it was invisible from every
+screen.
+
+When Correos send a parcel back they do not add events to the code it went out
+on. They create a NEW shipment, with a code of its own, whose destination is
+our warehouse — and the original goes quiet for ever:
+
+```
+PKA6TP9800129340147006H   out to the customer
+DXA6TP9800129340128012S   the same parcel coming back
+```
+
+Return Shield watched the first and had never heard of the second. So a parcel
+Correos delivered back to the warehouse on 19 November at 09:37 still read
+"Wrong address · Desestacionado, 18 Nov" a week later; eighty-seven parcels sat
+in "Coming back" and "Wrong address"; and the Returned tab had never, in the
+system's life, had a parcel in it.
+
+**The code can be computed, and that is not a guess.** A 23-character Correos
+code is five fields — prefix, 13-character core, parcel number, destination
+postcode, check letter — and a return keeps the core and the parcel number,
+takes the `DX` prefix, carries the returns postcode, and recomputes only the
+check letter, which is the Spanish DNI letter over the other 22 characters. The
+operator collected 109 real codes; the arithmetic in
+`lib/carriers/correos/return-code.ts` reproduces the check letter of every one
+and derives all 20 real return codes exactly from their originals. The twenty
+pairs are in `tests/return-code.test.ts` and are the reason the catch-up is
+allowed to compute a code rather than wait for Correos to name one.
+
+**Where a code came from is stored, because the two are not equally good.**
+`return_code_source` is `correos` when they named it in `associatedShipments`
+on the lookup — a field that was being parsed and then thrown away by
+`contextOf`'s whitelist — and `derived` when we worked it out. A `correos` code
+is never recomputed, so moving `RETURN_POSTCODE` cannot rewrite a code Correos
+confirmed for a parcel already travelling under it. Every screen that shows a
+code says which it is.
+
+**The return leg's events are on the same parcel and may say exactly two
+things.** They are stored with `leg = 'return'` on `shipment_events`, and
+`project()` takes the whole leg out of the state machine: before delivery the
+parcel is `returning`, on delivery it is `returned` at that event's time, and
+nothing else. This is not fussiness. Correos describe a van bringing a parcel
+back to US in precisely the words they use for a van taking one to a customer —
+"En reparto" read as an ordinary event says *out for delivery to them*, puts
+the parcel back on a worklist and starts messaging somebody about a parcel they
+refused last week; "Entregado" says *the customer has it*. The leg is also
+excluded from `preAdmittedAt`, or its own Prerregistrado would drag the ship
+date forward and move the parcel's place in the retention window.
+
+**What the arithmetic is NOT.** The 16-character EXPEDICIÓN that Correos report
+as `expeditionCode` ends in a letter computed some other way — `PKA6TP980012934`
+works out to `T` and the real expedición is `PKA6TP980012934D` — so the check
+letter is never used to validate one. `parseCorreosCode` reports `checkOk: null`
+for an expedición rather than `false`, and the Scanner never refuses a scan on
+it either way: a misread is caught 97.3% of the time, a transposition **never**
+(a sum does not care what order it is added in — 0 of 2,114 caught), and "beep
+means it is saved" has to stay true.
+
+### Phase DEVOLUCION beats the wording, and only that phase
+
+Twenty-nine parcels were in the Wrong-address worklist that were already coming
+back, some of them already back in the building. Correos start a return with a
+sentence about *why* it started — "Dirección incorrecta", with the long text
+"La dirección de destino no es correcta y se procede a la devolución del envío"
+— and the wording table matched `direccion incorrecta` first and called it
+`bad_address`. The operator was offered "Mark address as fixed with Correos"
+for a parcel on a shelf.
+
+So `matchCorreosEvent` now reads the phase before the wording tables, for
+DEVOLUCION alone. The phase is normally the weakest signal in the system and
+still is for everything else; DEVOLUCION is the exception because Correos use
+it for one thing only — every confirmed code in it (`L03D320R`, `L03D045R`)
+already maps to `returning`, and no event in any other phase does. A wording is
+a sentence about what happened; this phase is Correos' own classification of
+where the parcel is going.
+
+**A known code still wins**, which is what keeps the genuine wrong-address
+event where it was: `H01R421V` is "Dirección Incorrecta. Se procede a remitir
+el envío a la oficina de referencia" in phase EN ENTREGA — a real wrong address
+with the parcel held at an office — and it stays `bad_address`.
+
+"Desestacionado" needed a rule of its own. The word means a hold was lifted and
+says nothing about which way the parcel then went; it arrives in phase SIN
+FASE, so the phase rule cannot see it. Only Correos' longer text settles it
+("Envío pendiente de devolución"), and that text is read for this one wording
+rather than scanned for the word "devolución" anywhere — a blanket substring
+match over Correos' prose is how a rule starts catching things nobody checked.
+Every other Desestacionado still maps to nothing and still goes to the review
+queue.
+
+### A DX label is matched on characters 3 onwards, not on the 15-character base
+
+The Scanner matches a scan to a parcel on the first fifteen characters of the
+code — the one part the Código de Bulto and the EXPEDICIÓN share. Those fifteen
+are PREFIX plus core, so the two legs of one parcel have *different* bases
+(`PKA6TP980012934` and `DXA6TP980012934`), equal only from the third character.
+Every `DX` label the warehouse ever scanned matched nothing and was filed under
+"Not in Return Shield" — including the five real returns of 27 October, the
+only DX labels in the table.
+
+So the match now also compares the part the prefix is cut off: fifteen
+characters from the third for a 23-character bulto, which includes the parcel
+number and so names one box; thirteen for an EXPEDICIÓN, which names the
+shipment. Both widths are constants, backed by `shipments_core_idx` and
+`shipments_core13_idx`, and Postgres serves the whole four-way predicate as a
+BitmapOr across three indexes — measured at 0.15 ms against 20,000 parcels,
+against the seq scan a non-constant width would have forced.
+
+An exact `return_code` match counts as `exact` for the multi-parcel rule, for
+the same reason the outbound code does: a DX bulto carries the parcel number,
+so it names one box, and without that the phone would say "2 parcels with this
+number" while the worker holds the one it names.
+
+### A wrong-direction scan is questioned, never refused or corrected
+
+Two whole piles were scanned the wrong way round: fifty-two parcels in Incoming
+mode on 20 November in thirty-eight minutes while Correos had them out for
+delivery, and thirty more on the 25th, every one of them Pre-admisión. One of
+them read "Back in the warehouse · 20 Nov · 13:16" while Correos were driving
+it to the customer.
+
+Three deliberate limits on what the system does about it:
+
+**It never refuses the scan.** A wrong-direction verdict is an extra field on a
+successful `addScan`, not an `ok: false`. The route maps a failure to a 422 and
+the phone then *drops the read* and tells the worker to write the number down —
+losing a parcel to avoid a wrong label on a screen. "Beep means it is saved" is
+the contract the warehouse works to.
+
+**The phone decides only what the code settles.** A `DX` label in an Outgoing
+batch is certain from the code alone, so the phone warns before the read has
+even been sent — the only moment a warning reaches the worker while the parcel
+is still in their hand. The other direction needs the parcel: an ordinary label
+scanned IN is perfectly normal (a customer can bring a box back, and half the
+Returns tab is codes this system has never heard of), and what is *not* normal
+is scanning in a parcel Correos currently has out for delivery or has already
+delivered. That is a contradiction rather than a guess, and only the server
+knows it, so it arrives with the response as a sticky banner naming its own
+code — not a 1.2-second flash that would land on an unrelated parcel.
+
+**Nothing moves on its own.** A scan is a person saying they held the box, and
+the system does not get to overrule that on the strength of a carrier's feed.
+The doubtful rows get their own Returns section, with the reason named and a
+**Move to Outgoing** button — per scan, and per batch, because eighty-two
+presses is a correction that never gets made. The move changes the DIRECTION,
+not the batch: `scans_batch_code_idx` is unique on `(batch_id, code_as_read)`
+and `read_ids`/`times_read` are per-batch facts, and the scan does belong,
+historically, to the pile the worker was working. It is stamped
+(`direction_changed_at`) so "it was in the warehouse on the 20th" and "it never
+was" can be told apart afterwards.
+
+The states that count as a contradiction are `created`, `accepted`,
+`in_transit`, `out_for_delivery`, `delivered` and `collected`. `failed`,
+`at_office` and `bad_address` deliberately do NOT: a parcel may well be on its
+way back before Correos says so — eighteen of the eighty-seven returns were
+still travelling when the operator counted them — so scanning one in is early,
+not wrong, and a section that cried wolf about those would be ignored.
+
+### The return legs are polled one at a time, never through the batching client
+
+`TrackpubClient` learns the gateway's undocumented limits as it goes: a chunk
+that comes back without most of the codes it asked about is read as the format
+being refused, and it halves the batch size and writes the smaller number into
+settings for every future run. That is right for parcel codes and wrong for
+return codes, because **nobody knows whether trackpub serves a `DX` code at
+all** — the codes were read off Correos' *public* tracker, which is a different
+service, and no DX code has been put to `/search` with these credentials. If it
+does not serve them, a batch half full of DX codes looks identical to the
+gateway narrowing its limit, and one sweep would permanently drop the whole
+system to one request per parcel: 201 requests an hour to learn nothing.
+
+So `pollReturnLegs` uses the single path, which touches neither the batch mode
+nor the remembered size, with a hard cap of 40 legs per run. A 404 on a return
+code is counted as `unknown` rather than as an error — a derived code for a
+return Correos has not created yet does not exist on their side, and counting
+it as a failure would paint Settings red for the ordinary case while counting
+it as unreached would make the sweep believe it had run out of time and stop.
+Whatever happens is written to `correosReturnLeg` and shown on Settings in
+plain English, so "they answered none of them" can never read the same as "we
+have not tried".
+
+### The Returns tab's count now runs the same query as its sections
+
+It used to be `count(DISTINCT base)` over one index — cheap, on the grounds
+that a tab badge has to be payable on a screen that is not even showing it.
+Then `base` stopped being one row per parcel: a box scanned once on each of its
+two labels has two bases, so the badge said two and the list said one. A badge
+that disagrees with the list under it is worse than a slower badge, so the
+count runs the view's own CTE and the sections sum to it by construction. The
+cost is a pair of index lookups per incoming scan in the ninety-day window.
+
+### `shipment_events_dedupe_idx` was left leg-blind
+
+The dedupe index is `(shipment_id, event_code, occurred_at)` and knows nothing
+about `leg`. Replacing it would break the live app between the migration and
+Sync fork: drizzle's `onConflictDoNothing` names those three columns, and a
+four-column index would no longer be inferred for it. A cross-leg collision
+needs the same event code at the same instant on both legs of one parcel, which
+is vanishingly unlikely, so it is left alone on purpose and written down here
+rather than discovered later.
+
+---
+
 ## 8. Things I chose, where the brief left it open
 
 | | Chose | Why |

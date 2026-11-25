@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import type { CloseReason } from '@/lib/escalation/close-reasons';
 import type { UserRole } from '@/lib/auth/roles';
 import type { ScanDirection, ScanSource } from '@/lib/scan/model';
+import type { EventLeg, ReturnCodeSource } from '@/lib/carriers/correos/return-code';
 import {
   pgTable, text, integer, bigint, boolean, timestamp, jsonb, uuid,
   uniqueIndex, index, primaryKey, doublePrecision, check,
@@ -187,6 +188,34 @@ export const shipments = pgTable('shipments', {
    * checked longest ago is always next.
    */
   lastReconciledAt: timestamp('last_reconciled_at', { withTimezone: true }),
+  /**
+   * The code this parcel's return travels under.
+   *
+   * Correos do not add return events to the original code — they create a new
+   * shipment, with its own code, addressed to our warehouse. Until this column
+   * existed nothing in the database ever reached `returned`, because the leg
+   * that ends at our door is always the second code.
+   *
+   * Nullable because most parcels never come back.
+   */
+  returnCode: text('return_code'),
+  /** `correos` if they named it, `derived` if we worked it out. */
+  returnCodeSource: text('return_code_source').$type<ReturnCodeSource>(),
+  /**
+   * When Correos delivered the return to us, from the return leg's own
+   * delivery event. The one date that says a parcel is actually back.
+   */
+  returnedAt: timestamp('returned_at', { withTimezone: true }),
+  /**
+   * When the RETURN LEG was last asked about — not the parcel.
+   *
+   * A column of its own because `lastReconciledAt` is what the due rule reads:
+   * stamping that from a return-leg lookup would make the parcel look freshly
+   * checked and defer its outbound check by up to twelve hours, and a parcel
+   * in `bad_address` is on the three-hourly list because somebody is waiting
+   * on it. See lib/shipments/return-leg.ts.
+   */
+  returnCheckedAt: timestamp('return_checked_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   codeIdx: uniqueIndex('shipments_shipping_code_idx').on(t.shippingCode),
@@ -211,6 +240,28 @@ export const shipments = pgTable('shipments', {
    * scanned, on a phone, with somebody holding a box.
    */
   codeBaseIdx: index('shipments_code_base_idx').on(sql`left("shipping_code", 15)`),
+  /*
+   * The same comparison with the two-character prefix skipped, which is what
+   * matches a return label to the parcel it belongs to: a parcel goes out as
+   * PKA6TP980012934… and comes back as DXA6TP980012934…, equal from the third
+   * character. Fifteen characters from the third for a Código de Bulto (parcel
+   * number included, so it names one box), thirteen for an EXPEDICIÓN (which
+   * names the shipment). See lib/scan/match.ts.
+   */
+  coreIdx: index('shipments_core_idx').on(sql`substr("shipping_code", 3, 15)`),
+  core13Idx: index('shipments_core13_idx').on(sql`substr("shipping_code", 3, 13)`),
+  // The sweep asks about return codes too, and the answer has to find its way
+  // back to the row that owns it.
+  returnCodeIdx: index('shipments_return_code_idx').on(t.returnCode),
+  // The Returns tab, and "back with us per Correos, never scanned in".
+  returnedIdx: index('shipments_returned_idx').on(t.returnedAt),
+  /** The return-leg queue: oldest first, never-asked first. */
+  returnCheckIdx: index('shipments_return_check_idx').on(t.returnCheckedAt)
+    .where(sql`"return_code" IS NOT NULL AND "returned_at" IS NULL`),
+  returnSourceValid: check(
+    'shipments_return_code_source_valid',
+    sql`return_code_source IS NULL OR return_code_source IN ('correos', 'derived')`,
+  ),
 })).enableRLS();
 
 /**
@@ -236,10 +287,24 @@ export const shipmentEvents = pgTable('shipment_events', {
   mappedState: text('mapped_state'),
   officeCode: text('office_code'),
   officeName: text('office_name'),
+  /**
+   * Which journey this event belongs to: out to the customer, or back to us.
+   *
+   * Return events live on the same shipment row because it is one parcel and
+   * the operator reads one timeline — but a "En reparto" on the return leg is
+   * the parcel being driven back to US, and read as outbound it would say the
+   * customer is about to receive it and then message them about it. So the
+   * projection reads this, and a return event can do exactly two things: hold
+   * the parcel at `returning`, or move it to `returned` when it is delivered.
+   */
+  leg: text('leg').notNull().default('outbound').$type<EventLeg>(),
 }, (t) => ({
   dedupe: uniqueIndex('shipment_events_dedupe_idx').on(t.shipmentId, t.eventCode, t.occurredAt),
   shipmentIdx: index('shipment_events_shipment_idx').on(t.shipmentId, t.occurredAt),
   receivedIdx: index('shipment_events_received_idx').on(t.receivedAt),
+  // The parcel page draws the two legs apart; the projection reads them all.
+  legIdx: index('shipment_events_leg_idx').on(t.shipmentId, t.leg, t.occurredAt),
+  legValid: check('shipment_events_leg_valid', sql`leg IN ('outbound', 'return')`),
 })).enableRLS();
 
 /**
@@ -724,6 +789,20 @@ export const scans = pgTable('scans', {
    */
   orderNumber: text('order_number'),
   storeName: text('store_name'),
+  /**
+   * When somebody corrected this scan's direction, and nothing else.
+   *
+   * Null for almost every scan. It exists because two whole piles were scanned
+   * the wrong way round — fifty-two parcels on 20 November, thirty on the 25th
+   * — and both have to be moved to Outgoing. A scan that quietly changed
+   * direction would be the one thing on the Returns tab nobody could explain
+   * afterwards: "this parcel was in the warehouse on the 20th" becoming "it
+   * never was", with nothing saying who decided that or when.
+   *
+   * The scan stays in the batch it was taken in. Its direction is what moves —
+   * see `moveScanDirection` in lib/scan/batches.ts for why.
+   */
+  directionChangedAt: timestamp('direction_changed_at', { withTimezone: true }),
 }, (t) => ({
   /**
    * The same code twice in one batch is one parcel, read twice — never two
@@ -739,6 +818,16 @@ export const scans = pgTable('scans', {
   userTimeIdx: index('scans_user_time_idx').on(t.userId, t.scannedAt),
   /** The open batch, newest first, which is the phone's own list. */
   batchTimeIdx: index('scans_batch_time_idx').on(t.batchId, t.scannedAt),
+  /*
+   * The return leg's side of matching, which the Parcels list runs twice per
+   * row. `scans_batch_code_idx` is on (batch_id, code_as_read) and cannot
+   * serve `code_as_read` alone, and nothing indexed the leg-independent core —
+   * so without these two, "has it come back?" became a sequential scan of this
+   * table per parcel on the busiest screen. See lib/scan/match.ts.
+   */
+  codeIdx: index('scans_code_idx').on(t.codeAsRead),
+  coreIdx: index('scans_core_idx')
+    .on(sql`substr("code_as_read", 3, 15)`, t.direction, t.scannedAt),
   sourceValid: check('scans_source_valid', sql`source IN ('barcode', 'typed')`),
   directionValid: check('scans_direction_valid', sql`direction IN ('outgoing', 'incoming')`),
 })).enableRLS();

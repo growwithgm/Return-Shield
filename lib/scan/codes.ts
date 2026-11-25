@@ -21,7 +21,22 @@
  * happened to give us: Shopify's fulfilment carries the expedición, the
  * marketplace files sometimes carry the bulto. So a scan is matched on the
  * base, and the full code only decides between parcels of one shipment.
+ *
+ * ...EXCEPT WHEN THE PARCEL IS COMING BACK. A return travels under a code
+ * Correos invented for the journey home, which keeps the shipment's core and
+ * changes the prefix:
+ *
+ *   PKA6TP9800129340147006H   out to the customer
+ *   DXA6TP9800129340128012S   the same box coming back
+ *
+ * So the base of a return label differs from its parcel's in exactly its first
+ * two characters, and every `DX` label the warehouse has ever scanned matched
+ * nothing. The arithmetic for that lives in
+ * lib/carriers/correos/return-code.ts — one answer to "what is this code",
+ * shared with the sweep — and this file only reports what it finds.
  */
+
+import { hasValidCheckLetter, isReturnCode } from '@/lib/carriers/correos/return-code';
 
 /** Código de Bulto: 15-char base, 2-digit parcel no., 5-digit postal code, check letter. */
 const BULTO_RE = /^([A-Z0-9]{15})(\d{2})(\d{5})([A-Z])$/;
@@ -44,6 +59,32 @@ export interface CorreosCode {
   postalCode: string | null;
   checkLetter: string | null;
   kind: CodeKind;
+  /**
+   * A return label: the code a parcel comes back under, `DX…`.
+   *
+   * The cheapest and strongest thing the warehouse can know about direction. A
+   * `DX` label in somebody's hand is a box that came back, whatever mode the
+   * phone is in — which is how a pile of outgoing parcels scanned in Incoming
+   * mode, and five real returns filed under "Not in Return Shield", both get
+   * noticed while the worker is still standing there.
+   */
+  isReturn: boolean;
+  /**
+   * Does the last character match the other 22?
+   *
+   * True or false for a 23-character Código de Bulto. NULL for an EXPEDICIÓN,
+   * and that is not laziness: the expedición's own check letter is computed
+   * some other way — `PKA6TP980012934` works out to `T` and the real
+   * expedición is `PKA6TP980012934D` — so checking it would reject every
+   * expedición we have ever had.
+   *
+   * ADVISORY, NEVER A REFUSAL. A failed check letter is shown to the worker
+   * and the scan is still stored: the contract is that a beep means the parcel
+   * is saved, and a code refused here would be dropped by the phone and the
+   * parcel would be lost. It catches a misread bar, which is the common case,
+   * and cannot catch two characters swapped at all — see return-code.ts.
+   */
+  checkOk: boolean | null;
 }
 
 /**
@@ -82,6 +123,8 @@ export function parseCorreosCode(input: string): CorreosCode | null {
       postalCode: bulto[3],
       checkLetter: bulto[4],
       kind: 'bulto',
+      isReturn: isReturnCode(raw),
+      checkOk: hasValidCheckLetter(raw),
     };
   }
 
@@ -94,6 +137,9 @@ export function parseCorreosCode(input: string): CorreosCode | null {
       postalCode: null,
       checkLetter: exp[2] ?? null,
       kind: 'expedicion',
+      isReturn: isReturnCode(raw),
+      // Null, not false. See `checkOk`: an expedición's letter is not this one.
+      checkOk: null,
     };
   }
 
@@ -109,7 +155,14 @@ export function parseCorreosCode(input: string): CorreosCode | null {
  * still open, which is cheaper than a batch with a code nobody can match.
  */
 export function readsAs(code: CorreosCode): string {
-  if (code.kind === 'bulto') return `${code.raw.length} characters · Código de Bulto`;
-  if (code.checkLetter) return `${code.raw.length} characters · EXPEDICIÓN number`;
-  return `${code.raw.length} characters · EXPEDICIÓN without its check letter`;
+  // The return label first, because it is the one fact that changes what the
+  // worker should do with the box in their hand.
+  const leg = code.isReturn ? ' · return label' : '';
+  const bad = code.checkOk === false ? ' · check letter does not match' : '';
+
+  if (code.kind === 'bulto') {
+    return `${code.raw.length} characters · Código de Bulto${leg}${bad}`;
+  }
+  if (code.checkLetter) return `${code.raw.length} characters · EXPEDICIÓN number${leg}`;
+  return `${code.raw.length} characters · EXPEDICIÓN without its check letter${leg}`;
 }

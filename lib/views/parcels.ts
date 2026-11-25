@@ -419,10 +419,21 @@ function base(): SQL {
              AND e.mapped_state = 'out_for_delivery'
              AND (s.office_arrived_at IS NULL OR e.occurred_at <= s.office_arrived_at)
         ) tried ON true
+        /*
+         * The newest OUTBOUND event, and the leg filter is not optional.
+         *
+         * Without it this row would show the return leg's wording, which
+         * describes a van driving the parcel back to US: "En reparto" on a
+         * customer's row reads as "out for delivery to them", and "Entregado"
+         * reads as "they have it". Both would be read off this screen and said
+         * to a customer on the phone. The return has its own line on the
+         * parcel page, marked as the return - see components/EventTimeline.tsx.
+         */
         LEFT JOIN LATERAL (
           SELECT e.event_desc, e.mapped_state, e.occurred_at, e.event_code
             FROM shipment_events e
            WHERE e.shipment_id = s.id
+             AND e.leg = 'outbound'
            ORDER BY e.occurred_at DESC
            LIMIT 1
         ) ev ON true

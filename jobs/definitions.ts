@@ -11,6 +11,9 @@ import { nextSizeUp, shouldProbeLargerBatch, trackpub } from '@/lib/carriers/cor
 import { ingestEvent, settleHistory } from '@/lib/shipments/ingest';
 import { remapKnownEvents } from '@/lib/shipments/remap';
 import {
+  assignReturnCodes, noteAssociatedCodes, pollReturnLegs,
+} from '@/lib/shipments/return-leg';
+import {
   countLive, countOverdue, dueCutoffs, dueSql, liveSql,
   recheckHours, urgentRecheckHours, URGENT_STATES,
 } from '@/lib/recheck';
@@ -219,6 +222,20 @@ export async function drainPushInbox(limit = 200): Promise<JobResult> {
  * fifty HTTP requests; no stamping until the end would lose the lot.
  */
 const STAMP_EVERY = 100;
+
+/**
+ * How many return legs one run will ask Correos about.
+ *
+ * A HARD CAP, not a target, and it is the one number protecting the sweep from
+ * a feature that cannot be batched. Every return leg costs its own request —
+ * see `pollReturnLegs` for why they must not go through the batching client —
+ * so without a cap a day on which two hundred parcels were sent back would add
+ * two hundred serial requests to an hourly job that currently makes about
+ * fifty. Eighteen are travelling today, and the catch-up has its own, larger
+ * limit for the backlog; anything above this waits for the next hour, which is
+ * the right trade for a parcel already in Correos' hands.
+ */
+const RETURN_LEGS_PER_RUN = 40;
 
 export interface ReconcileOptions {
   /** Most parcels to consider in one run. The budget is the real limiter. */
@@ -476,6 +493,17 @@ export async function reconcile(opts: ReconcileOptions = {}): Promise<JobResult>
       if (one.ok) {
         const history = firstRead.has(code);
 
+        /*
+         * THE SECOND CODE, straight from Correos' own answer.
+         *
+         * `associatedShipments` on the shipment is the code the parcel comes
+         * back under, and it is the one source better than our own arithmetic.
+         * It arrives on the ordinary parcel lookup — nothing extra is asked
+         * for — and until this line it was parsed, carried through the
+         * normaliser and then thrown away.
+         */
+        if (one.outcome.associated.length) await noteAssociatedCodes(one.outcome.associated);
+
         for (const event of one.outcome.events) {
           // Quiet for a first read: write the event, recompute the state, and
           // narrate nothing. What the parcel needs today is decided once,
@@ -535,6 +563,34 @@ export async function reconcile(opts: ReconcileOptions = {}): Promise<JobResult>
       break;
     }
   }
+
+  /*
+   * AND NOW THE OTHER HALF OF EVERY PARCEL THAT IS COMING BACK.
+   *
+   * Everything above asks about the code on the label that went out. For a
+   * parcel Correos has sent back that code will never move again — they create
+   * a second shipment with a code of its own, and the journey to our door
+   * happens entirely under that one. This is where it is asked about. Without
+   * it the sweep could run for a year and no parcel would ever reach
+   * `returned`, which is exactly what had happened.
+   *
+   * `assignReturnCodes` first, so a DEVOLUCION event that arrived in the loop
+   * above gets its code in the same run rather than the next one.
+   *
+   * ONE REQUEST PER TRAVELLING RETURN, and never through the batching client:
+   * see `pollReturnLegs` for why mixing codes Correos may not serve into a
+   * batch could permanently halve the sweep's throughput.
+   *
+   * It is also the only place that learns whether trackpub answers a DX code
+   * at all, which nobody knows yet — so the answer is stored for the Settings
+   * screen whatever it turns out to be, including a refusal.
+   */
+  const assigned = await assignReturnCodes();
+  const returnLeg = await pollReturnLegs(client, {
+    limit: RETURN_LEGS_PER_RUN,
+    deadline: elapsedFrom + budgetMs,
+  });
+  if (returnLeg.asked > 0) await setSetting('correosReturnLeg', returnLeg);
 
   // Remember what we learnt about the undocumented batch format, so the next
   // run does not have to probe for it again.
@@ -627,6 +683,15 @@ export async function reconcile(opts: ReconcileOptions = {}): Promise<JobResult>
       ...(settledHistory ? { settledHistory } : {}),
       ...(remap.events ? { remappedEvents: remap.events, remappedParcels: remap.moved } : {}),
       ...(remap.resolved.length ? { nowRecognised: remap.resolved } : {}),
+      ...(assigned.derived ? { returnCodesDerived: assigned.derived } : {}),
+      ...(returnLeg.asked ? {
+        returnLegsAsked: returnLeg.asked,
+        returnLegsAnswered: returnLeg.answered,
+        ...(returnLeg.unknown ? { returnLegsUnknown: returnLeg.unknown } : {}),
+        ...(returnLeg.newEvents ? { returnLegEvents: returnLeg.newEvents } : {}),
+        ...(returnLeg.arrived ? { backWithUs: returnLeg.arrived } : {}),
+        ...(returnLeg.failed ? { returnLegsRefused: returnLeg.firstError } : {}),
+      } : {}),
       ...(stoppedEarly ? { stoppedEarly } : {}),
       ...(failures.length ? { failures: failures.slice(0, 10) } : {}),
     },

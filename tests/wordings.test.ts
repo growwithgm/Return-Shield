@@ -114,16 +114,79 @@ describe('the wordings as received', () => {
 
   it('rescues an unknown return wording from the DEVOLUCION phase', () => {
     expect(matchCorreosEvent(null, 'Trámite aduanero de devolución', 'DEVOLUCION'))
-      .toEqual({ state: 'returning', via: 'phase' });
+      .toEqual({ state: 'returning', via: 'return-phase' });
   });
 
-  it('still lets a known code or wording beat the phase', () => {
+  /*
+   * THE RULE THAT COST TWENTY-NINE PARCELS.
+   *
+   * Correos start a return with a sentence about WHY it started, and the
+   * wording table reads that sentence literally. "Dirección incorrecta" in
+   * phase DEVOLUCION is the address being wrong AND the parcel already on its
+   * way back; read as a wording it is `bad_address`, so twenty-nine parcels
+   * sat in the Wrong-address worklist offering "Mark address as fixed with
+   * Correos" while twenty-six of them were already back in the building.
+   *
+   * So the phase now beats the wording — but only this phase, and only because
+   * Correos use it for one thing. A known CODE still beats it, which is what
+   * keeps the genuine wrong-address event (`H01R421V`, phase EN ENTREGA)
+   * exactly where it was.
+   */
+  it('lets phase DEVOLUCION beat the wording, because the wording is the reason', () => {
+    expect(matchCorreosEvent(null, 'Dirección incorrecta', 'DEVOLUCION'))
+      .toEqual({ state: 'returning', via: 'return-phase' });
+    // Without the phase it is still a wrong address. Nothing else changed.
+    expect(matchCorreosEvent(null, 'Dirección incorrecta', 'EN ENTREGA'))
+      .toEqual({ state: 'bad_address', via: 'description' });
+  });
+
+  it('keeps H01R421V as a wrong address: a known code beats the phase', () => {
+    expect(matchCorreosEvent(
+      'H01R421V',
+      'Dirección Incorrecta. Se procede a remitir el envío a la oficina de referencia',
+      'EN ENTREGA',
+    )).toEqual({ state: 'bad_address', via: 'code' });
+  });
+
+  it('still lets a known code beat the phase', () => {
     // The phase says it is going back; the code says it is at the counter.
-    // The code wins, because the phase is the weakest signal we have.
+    // A code is the one signal more specific than the phase.
     expect(matchCorreosEvent(AT_OFFICE.code, 'whatever', 'DEVOLUCION'))
       .toEqual({ state: 'at_office', via: 'code' });
-    expect(matchCorreosEvent(null, 'Entregado', 'DEVOLUCION'))
-      .toEqual({ state: 'delivered', via: 'description' });
+  });
+
+  /*
+   * "Desestacionado" is one word with two meanings, and only Correos' longer
+   * text says which: a hold lifted so the parcel can go ON, or lifted so it
+   * can go BACK. It arrives in phase SIN FASE, so the phase rule cannot see it.
+   */
+  it('reads Desestacionado as a return only when the long text says so', () => {
+    expect(matchCorreosEvent(
+      'M02E340V', 'Desestacionado', 'SIN FASE', 'Envío pendiente de devolución',
+    )).toEqual({ state: 'returning', via: 'return-text' });
+
+    // The same word with no long text stays unknown, and stays in the queue.
+    expect(matchCorreosEvent('M02E340V', 'Desestacionado', 'SIN FASE')).toBeNull();
+    expect(needsReview('M02E340V', 'Desestacionado', 'SIN FASE')).toBe(true);
+
+    // And a long text about something else does not rescue it either.
+    expect(matchCorreosEvent(
+      'M02E340V', 'Desestacionado', 'SIN FASE', 'Envío disponible para su reparto',
+    )).toBeNull();
+  });
+
+  it('does not queue a DEVOLUCION event whose wording we already know', () => {
+    // The twenty-nine. Their wording has been in the table since week one, so
+    // there is nothing to learn from filing twenty-nine identical queue rows.
+    expect(needsReview(null, 'Dirección incorrecta', 'DEVOLUCION')).toBe(false);
+    // An unfamiliar return wording IS worth collecting.
+    expect(needsReview(null, 'Trámite aduanero de devolución', 'DEVOLUCION')).toBe(true);
+  });
+
+  it('does not queue a Desestacionado the long text explained', () => {
+    expect(needsReview(
+      'M02E340V', 'Desestacionado', 'SIN FASE', 'Envío pendiente de devolución',
+    )).toBe(false);
   });
 
   it('keeps a phase-only match in the review queue', () => {

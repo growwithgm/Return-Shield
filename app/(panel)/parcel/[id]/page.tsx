@@ -115,6 +115,30 @@ export default async function ParcelPage({ params }: { params: { id: string } })
               {row.shippingCode}
             </CopyButton>
           </Field>
+          {/*
+            * The code it comes back under, and where that came from.
+            *
+            * Shown only once there IS one, so it does not add a permanently
+            * empty field to every parcel. The source is on it because the two
+            * are not equally trustworthy: "Correos" is their own answer, and
+            * "worked out" is our arithmetic on the original, which is right
+            * for all 109 codes we have checked and is still arithmetic. The
+            * operator types this number into Mi Oficina.
+            */}
+          {row.returnCode && (
+            <Field label={row.returnedAt ? 'Came back as' : 'Comes back as'}>
+              <CopyButton
+                text={row.returnCode}
+                said={`Return code ${row.returnCode} copied.`}
+                className="border-b border-dashed border-line font-mono text-[13px] font-medium text-ink"
+              >
+                {row.returnCode}
+              </CopyButton>
+              <span className="ml-[6px] text-[11px] text-muted">
+                {row.returnCodeSource === 'correos' ? 'from Correos' : 'worked out'}
+              </span>
+            </Field>
+          )}
           <Field label="Shop"><span className="text-[13px] font-medium">{row.storeName}</span></Field>
           <Field label="At risk"><span className="tnum text-[13px] font-semibold">{row.valueText}</span></Field>
           <Field label="Payment"><PayBadge method={row.paymentMethod} long /></Field>
@@ -182,6 +206,8 @@ export default async function ParcelPage({ params }: { params: { id: string } })
                 exact: exact(e.occurredAt),
                 source: e.source === 'poll' ? 'Found when we asked Correos' : 'Live from Correos',
                 first: i === 0,
+                // The journey home, marked as such. See components/EventTimeline.tsx.
+                returnCode: e.leg === 'return' ? row.returnCode : null,
               }))}
               tone={tone}
             />

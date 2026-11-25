@@ -19,7 +19,8 @@ import { settleHistory } from './ingest';
  * that happen to get another event afterwards — and a parcel whose window has
  * closed is precisely one Correos has nothing more to say about.
  *
- * THE WORK IS KEYED ON DISTINCT (code, wording, phase) TRIPLES, not on rows.
+ * THE WORK IS KEYED ON DISTINCT (code, wording, phase, long text) GROUPS, not
+ * on rows.
  * Correos sends a few dozen distinct events across tens of thousands of rows,
  * so one grouped scan finds everything that could possibly change, and the
  * normal case — nothing changed since the last sweep — costs one query.
@@ -31,7 +32,7 @@ import { settleHistory } from './ingest';
  */
 
 export interface RemapOutcome {
-  /** Distinct (code, wording, phase) triples examined. */
+  /** Distinct (code, wording, phase, long text) groups examined. */
   triples: number;
   /** Event rows whose mapped state changed. */
   events: number;
@@ -47,6 +48,7 @@ interface TripleRow {
   event_code: string;
   event_desc: string;
   phase: string | null;
+  long_text: string | null;
   mapped_state: string | null;
 }
 
@@ -56,13 +58,25 @@ export async function remapKnownEvents(): Promise<RemapOutcome> {
   // `phaseDes` is trackpub v2's spelling and `phase` the push feed's; neither
   // is a column, because nothing but the mapper has ever needed it. They live
   // on the stored payload, which is the whole point of storing it.
+  /*
+   * THE LONG TEXT IS PART OF THE KEY, and it has to be.
+   *
+   * "Desestacionado" is one wording with two meanings — a hold lifted so the
+   * parcel can go on, or a hold lifted so it can go back — and the only thing
+   * that tells them apart is Correos' longer text ("Envío pendiente de
+   * devolución"). Grouping without it would map every Desestacionado the same
+   * way, which is how the warehouse ended up with twenty-nine parcels filed
+   * under the wrong heading. It costs nothing: Correos send a few dozen
+   * distinct wordings in all, and the long text splits one of them in two.
+   */
   const groups = await getDb().execute(raw`
     SELECT event_code,
            event_desc,
            COALESCE(raw_payload->>'phaseDes', raw_payload->>'phase') AS phase,
+           COALESCE(raw_payload->>'expandedText', raw_payload->>'extendedText') AS long_text,
            mapped_state
       FROM shipment_events
-     GROUP BY 1, 2, 3, 4
+     GROUP BY 1, 2, 3, 4, 5
   `);
 
   const triples = rowsOf<TripleRow>(groups);
@@ -72,7 +86,7 @@ export async function remapKnownEvents(): Promise<RemapOutcome> {
   const touched = new Set<string>();
 
   for (const t of triples) {
-    const match = matchCorreosEvent(t.event_code, t.event_desc, t.phase);
+    const match = matchCorreosEvent(t.event_code, t.event_desc, t.phase, t.long_text);
     if (!match) continue;
     if (match.state === t.mapped_state) continue;
 
@@ -86,6 +100,8 @@ export async function remapKnownEvents(): Promise<RemapOutcome> {
          AND event_desc = ${t.event_desc}
          AND COALESCE(raw_payload->>'phaseDes', raw_payload->>'phase')
                IS NOT DISTINCT FROM ${t.phase}
+         AND COALESCE(raw_payload->>'expandedText', raw_payload->>'extendedText')
+               IS NOT DISTINCT FROM ${t.long_text}
          AND mapped_state IS NOT DISTINCT FROM ${t.mapped_state}
       RETURNING shipment_id
     `);
@@ -94,9 +110,13 @@ export async function remapKnownEvents(): Promise<RemapOutcome> {
     out.events += rows.length;
     for (const r of rows) touched.add(r.shipment_id);
 
-    // Only a code or a wording answers the review queue. A phase match is
+    // Only a code or a wording answers the review queue. A bare phase match is
     // still a parcel moving on a guess, which is exactly what the queue is
     // for, so those rows stay open.
+    //
+    // `return-phase` and `return-text` are NOT guesses and do close their row:
+    // phase DEVOLUCION means a return whatever the wording says, and
+    // "pendiente de devolución" says so in words. See state-map.ts.
     if (match.via !== 'phase') {
       const resolved = await resolveReview(t.event_code, t.event_desc, match.state);
       if (resolved) out.resolved.push(`${t.event_code} → ${match.state}`);

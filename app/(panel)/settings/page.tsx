@@ -3,6 +3,8 @@ import { getDb } from '@/db';
 import { eventReviewQueue, postcodeStats, stores } from '@/db/schema';
 import { ShopifyPull } from '@/components/ShopifyPull';
 import { TikTokHandover } from '@/components/TikTokHandover';
+import { ReturnCatchUp } from '@/components/ReturnCatchUp';
+import { describeProbe } from '@/lib/shipments/return-leg';
 import { IntegrationsPanel } from '@/components/IntegrationsPanel';
 import { SweepPanel } from '@/components/SweepPanel';
 import { JobRunsPanel } from '@/components/JobRunsPanel';
@@ -41,7 +43,7 @@ export default async function SettingsPage() {
 
   const [
     watched, review, integrations, jobs, batchMode, bytes, shopifyStores, capacity, silence,
-    workers,
+    workers, returnLeg,
   ] = await Promise.all([
     getDb().select().from(postcodeStats).where(eq(postcodeStats.watch, true)).orderBy(desc(postcodeStats.failRate)),
     getDb().select().from(eventReviewQueue)
@@ -57,6 +59,17 @@ export default async function SettingsPage() {
     sweepCapacity(),
     sweepSilence(),
     scannerAccounts(),
+    /*
+     * WHETHER CORREOS ANSWERS A RETURN CODE AT ALL.
+     *
+     * The `DX` codes were read off Correos' public tracker, which is a
+     * different service from the trackpub `/search` the sweep uses, and no DX
+     * code had ever been put to it with these credentials. Rather than assume
+     * either way, every sweep records what happened and this says it in plain
+     * English — so "they answered none of them" can never read the same as
+     * "we have not tried". See lib/shipments/return-leg.ts.
+     */
+    getSetting('correosReturnLeg'),
   ]);
 
   const windowDays = retentionDays();
@@ -169,6 +182,26 @@ export default async function SettingsPage() {
           </Card>
         </div>
       )}
+
+      {/*
+        * TOP LEVEL, not inside the Shopify card. That card is drawn only when
+        * a Shopify shop is connected, and a deploy whose parcels all came from
+        * TikTok and Amazon uploads is exactly the deploy whose returns need
+        * catching up — hiding the button there would hide it from the people
+        * who need it most.
+        */}
+      <div className="mt-[22px]">
+        <Card
+          title="Returns"
+          note="the second code every parcel comes back under"
+        >
+          <div className="border-b border-line px-[14px] py-[11px] text-[12px] leading-[1.5] text-muted">
+            <span className="font-semibold text-ink">Does Correos answer a return code? </span>
+            {describeProbe(returnLeg)}
+          </div>
+          <ReturnCatchUp />
+        </Card>
+      </div>
 
       <div className="mt-[22px]">
         <StoragePanel bytes={bytes} windowDays={windowDays} />

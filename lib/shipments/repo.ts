@@ -22,6 +22,10 @@ export async function eventsFor(shipmentId: string): Promise<ProjectableEvent[]>
     mappedState: shipmentEvents.mappedState,
     officeCode: shipmentEvents.officeCode,
     officeName: shipmentEvents.officeName,
+    // Which journey the event belongs to. Without it `project` cannot tell a
+    // van bringing the parcel back to us from one taking it to the customer,
+    // and the two read identically in Correos' words.
+    leg: shipmentEvents.leg,
   }).from(shipmentEvents).where(eq(shipmentEvents.shipmentId, shipmentId));
 
   return rows.map((r) => ({ ...r, mappedState: r.mappedState as ShipmentState | null }));
@@ -59,6 +63,9 @@ export async function reproject(shipmentId: string): Promise<Projection> {
     failedAt: p.failedAt,
     lastEventAt: p.lastEventAt,
     officeId,
+    // The one date that says a parcel is physically back. Written from the
+    // return leg's own delivery event, so a replay produces the same answer.
+    returnedAt: p.returnedAt,
     // The ship date only when nothing better is already there. A Shopify
     // fulfilment date or a file's `ship-date` is the real thing and must not
     // be overwritten by Correos' first sighting of the label, which is hours

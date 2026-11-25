@@ -112,3 +112,116 @@ export function v2Event(
     sectionCode: null,
   };
 }
+
+/**
+ * The response that showed what the system had been missing.
+ *
+ * Correos' own answer for `PKA6TP9800129340147006H` — Cristina Martínez's
+ * parcel, TikTok order 576982410859617218 — with the field nothing here had
+ * ever read:
+ *
+ *   associatedShipments: [{ shipmentCode: 'DXA6TP9800129340128012S' }]
+ *
+ * That second code is the parcel coming back. Correos created it on 18
+ * November at 11:44 and delivered it to our warehouse on the 19th at 09:37,
+ * while Return Shield went on showing "Wrong address · Desestacionado, 18
+ * Nov", because the original code's last event is the one that starts the
+ * return and then it goes quiet for ever.
+ *
+ * Shortened to the events that matter. Every personal field was blank in the
+ * capture and is kept blank: this file is in a public repository.
+ */
+export const RETURN_STARTED_RESPONSE: unknown = [
+  {
+    code: 'PKA6TP9800129340147006H',
+    reference1: '576982410859617218',
+    expeditionCode: 'PKA6TP980012934D',
+    totalPackage: 1,
+    numberPackage: 1,
+    remitName: null,
+    destiName: null,
+    receiverName: null,
+    events: [
+      {
+        eventDate: '18/11/2026',
+        eventHours: '10:00:00',
+        eventCode: 'M02E340V',
+        phase: null,
+        phaseDes: 'SIN FASE',
+        summaryText: 'Desestacionado',
+        expandedText: 'Envío pendiente de devolución',
+      },
+      {
+        eventDate: '18/11/2026',
+        eventHours: '11:44:00',
+        eventCode: 'L03D099R',
+        phase: null,
+        phaseDes: 'DEVOLUCION',
+        summaryText: 'Dirección incorrecta',
+        expandedText: 'La dirección de destino no es correcta y se procede a la devolución del envío',
+      },
+    ],
+    error: { codError: 0, desError: '' },
+    associatedShipments: [{ shipmentCode: 'DXA6TP9800129340128012S' }],
+  },
+];
+
+/** The parcel's own code, and the one it comes back under. */
+export const RETURN_ORIGINAL = 'PKA6TP9800129340147006H';
+export const RETURN_CODE = 'DXA6TP9800129340128012S';
+
+/**
+ * And the return leg's own answer: the journey to our door, ending delivered.
+ *
+ * This is the response nobody has yet seen from trackpub — the codes were read
+ * off Correos' PUBLIC tracker, which is a different service, and no DX code
+ * has been put to `/search` with these credentials. So this fixture is built
+ * from the public tracker's eight events rather than captured, and the
+ * Settings test is what will confirm the real shape. Said plainly here so
+ * nobody mistakes it for a capture.
+ */
+export const RETURN_LEG_RESPONSE: unknown = [
+  {
+    code: 'DXA6TP9800129340128012S',
+    reference1: null,
+    expeditionCode: 'DXA6TP980012934A',
+    totalPackage: 1,
+    numberPackage: 1,
+    events: [
+      {
+        eventDate: '18/11/2026',
+        eventHours: '11:44:00',
+        eventCode: 'A090000V',
+        phaseDes: 'PRE-ADMISIÓN',
+        summaryText: 'Devolución admitida',
+        expandedText: 'Devolución admitida',
+      },
+      {
+        eventDate: '18/11/2026',
+        eventHours: '19:02:00',
+        eventCode: 'P040000V',
+        phaseDes: 'EN CAMINO',
+        summaryText: 'Clasificado',
+        expandedText: 'Envío clasificado en Centro Logístico',
+      },
+      {
+        eventDate: '19/11/2026',
+        eventHours: '08:11:00',
+        eventCode: 'G01L010V',
+        phaseDes: 'EN ENTREGA',
+        summaryText: 'Alta en la unidad de reparto',
+        expandedText: 'Alta en la unidad de reparto',
+      },
+      {
+        eventDate: '19/11/2026',
+        eventHours: '09:37:00',
+        eventCode: 'I01E010V',
+        phaseDes: 'ENTREGADO',
+        summaryText: 'Entregado',
+        expandedText: 'Envío entregado',
+      },
+    ],
+    error: { codError: 0, desError: '' },
+    associatedShipments: [],
+  },
+];
