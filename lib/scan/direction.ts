@@ -136,6 +136,34 @@ export function doubtFromParcel(
 }
 
 /**
+ * Whether the phone can reach every verdict this direction can produce.
+ *
+ * This is the hinge the scanner's counting hangs on, so it is worth spelling
+ * out. There are two wrong-direction verdicts and they live in different
+ * batches:
+ *
+ *   outgoing   `return-in-outgoing`, which `doubtFromCode` settles from the
+ *              code alone. `doubtFromParcel` hands back that same verdict and
+ *              then nothing else — its first line returns `doubtFromCode` and
+ *              its second gives up unless the direction is `incoming`. So in
+ *              an Outgoing batch the server can tell the phone nothing the
+ *              phone did not already know before the read was even sent.
+ *   incoming   `outbound-in-incoming`, which needs the parcel's state. The
+ *              phone cannot reach it at all, and `doubtFromCode` says nothing
+ *              about an ordinary label read IN, because reading one in is
+ *              normal.
+ *
+ * So each direction has exactly ONE place that can settle a read: the phone
+ * for Outgoing, the server for Incoming. The scanner uses that to count each
+ * read once, in the order the reads were taken. Counting in both places is
+ * what beeped twice for one box and walked the banner's "that is 3 in a row"
+ * back to 1 when a good box's answer happened to come back in the middle.
+ */
+export function phoneSettlesEveryRead(direction: ScanDirection): boolean {
+  return direction === 'outgoing';
+}
+
+/**
  * How many doubtful reads in a row before the whole batch is worth questioning.
  *
  * Three, because one is a parcel and three is a pile. The wrong-mode batches
@@ -145,46 +173,36 @@ export function doubtFromParcel(
 export const DOUBT_RUN = 3;
 
 /**
- * A run of doubtful reads, and which reads have already been counted into it.
+ * A run of consecutive parcels that looked like they were going the wrong way,
+ * and which parcels are already in it.
  *
  * `count` is the number the banner prints, so it has to be the number of
- * PARCELS the worker has read — not the number of verdicts the app has
- * handled. Those differ for exactly one case: a DX label in an Outgoing
- * batch, which the phone settles from the code before the read is even sent
- * and which the server then agrees with on purpose (see `doubtFromParcel`).
- * Counting both landed the same parcel twice, so two DX labels announced
- * "That is 3 in a row" to a worker who had read two.
- *
- * `counted` holds readIds, and a readId survives a resend, so a lost response
- * that comes back twice is still one parcel.
+ * PARCELS the worker has read — not the number of reads the app has handled.
+ * Those differ whenever one box is scanned twice, so `parcels` holds CODES
+ * rather than read ids: the same label read three times is one parcel, and the
+ * banner never offers to re-file a whole batch over a single box. A resent
+ * read carries the same code as well, so an answer that was lost and comes
+ * back twice is also still one parcel.
  */
 export type DoubtRun = {
   readonly count: number;
-  readonly counted: readonly string[];
+  readonly parcels: readonly string[];
 };
 
-/** No doubtful reads: where a batch starts, and what any good read restores. */
-export const NO_DOUBT_RUN: DoubtRun = { count: 0, counted: [] };
+/** No doubtful parcels: where a batch starts, and what any good read restores. */
+export const NO_DOUBT_RUN: DoubtRun = { count: 0, parcels: [] };
 
 /**
- * Whether this read is already in the run.
+ * The run after one read of `code`, doubtful or not.
  *
- * The phone needs this as well as the count: it beeps when a run STARTS, and
- * a read it has already beeped for must not beep again when the server sends
- * the same verdict back.
+ * A read that looked fine breaks the run: three in a row is a pile, three
+ * scattered through sixty is not. Call it once per read, from the single place
+ * that settles reads in this direction — see `phoneSettlesEveryRead`. Calling
+ * it from two places cannot be made safe by counting more carefully: the two
+ * see the same reads in different orders.
  */
-export function alreadyCounted(run: DoubtRun, readId: string): boolean {
-  return run.counted.includes(readId);
-}
-
-/**
- * The run after one read, doubtful or not.
- *
- * A read the server was happy with breaks it: three in a row is a pile, three
- * scattered through sixty is not.
- */
-export function afterRead(run: DoubtRun, readId: string, doubtful: boolean): DoubtRun {
+export function afterRead(run: DoubtRun, code: string, doubtful: boolean): DoubtRun {
   if (!doubtful) return NO_DOUBT_RUN;
-  if (alreadyCounted(run, readId)) return run;
-  return { count: run.count + 1, counted: [...run.counted, readId] };
+  if (run.parcels.includes(code)) return run;
+  return { count: run.count + 1, parcels: [...run.parcels, code] };
 }

@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { parseCorreosCode, type CorreosCode } from '@/lib/scan/codes';
 import {
-  DOUBT_RUN, NO_DOUBT_RUN, afterRead, alreadyCounted, doubtFromCode,
+  DOUBT_RUN, NO_DOUBT_RUN, afterRead, doubtFromCode, phoneSettlesEveryRead,
   type DirectionDoubt, type DirectionVerdict, type DoubtRun,
 } from '@/lib/scan/direction';
 import { summarise, type Batch, type ScanItem } from '@/lib/scan/items';
@@ -134,9 +134,16 @@ export function ScannerApp({
    */
   const [doubt, setDoubt] = useState<Doubt | null>(null);
   /*
-   * ONE READ, ONE COUNT — see `afterRead` in lib/scan/direction.ts, which
-   * holds the rule so it can be driven read by read in a test. This file only
-   * decides WHEN a read happened; it does not get to decide what counts.
+   * ONE PARCEL, ONE COUNT, COUNTED IN ONE PLACE — see `afterRead` and
+   * `phoneSettlesEveryRead` in lib/scan/direction.ts, which hold the rule so
+   * it can be driven read by read in a test. This file only decides WHEN a
+   * read happened; it does not get to decide what counts.
+   *
+   * The "one place" half is the part that bites. Each read passes through this
+   * component twice — once in `take`, once when the server answers in `flush`
+   * — and only one of those passes may touch the run, because only `take` sees
+   * reads in the order they were scanned. Which one it is depends on the
+   * direction, and `phoneSettlesEveryRead` is the whole of that decision.
    */
   const doubtRun = useRef<DoubtRun>(NO_DOUBT_RUN);
 
@@ -256,23 +263,37 @@ export function ScannerApp({
          * here the 1.2-second flash would be over, and flashing it now would
          * flash it over an unrelated parcel.
          */
-        if (body.doubt) {
-          /*
-           * The phone may have settled this same read already, from the code
-           * alone. Then it is not a new parcel and it has already beeped: the
-           * banner is refreshed, the count is not raised, and the phone stays
-           * quiet. Beeping twice for one box is how a worker learns to ignore
-           * the sound.
-           */
-          const beeped = alreadyCounted(doubtRun.current, read.readId);
-          doubtRun.current = afterRead(doubtRun.current, read.readId, true);
-          const run = doubtRun.current.count;
-          setDoubt(doubtVerdict(body.doubt, body.item.codeAsRead, run));
-          if (!beeped && run === 1) beepWrongWay();
-        } else {
-          // A read the server was happy with breaks the run: three in a row is
-          // a pile, three scattered through sixty is not.
-          doubtRun.current = afterRead(doubtRun.current, read.readId, false);
+        /*
+         * AND THE SERVER COUNTS ONLY WHAT THE PHONE COULD NOT. In an Outgoing
+         * batch `take` settled every one of these reads from the code, in the
+         * worker's hand, in the order they were scanned, and the server agrees
+         * with it on purpose; so there is nothing here to count, nothing to
+         * beep, and nothing to put on screen that is not on it already.
+         *
+         * Not merely redundant — wrong. These answers come back in their own
+         * time. The answer for one box can land after the next three have been
+         * scanned, and the answer for a GOOD box can land in between. Counting
+         * here as well as in `take` let that good answer break a run of three
+         * that nothing had broken: it beeped a second time for a box the
+         * worker had already been warned about, and walked the banner's "that
+         * is 3 in a row" down to 1 and back up while the Switch button sat
+         * still underneath it.
+         */
+        if (!phoneSettlesEveryRead(direction)) {
+          const before = doubtRun.current.count;
+          doubtRun.current = afterRead(doubtRun.current, body.item.codeAsRead, body.doubt != null);
+
+          if (body.doubt) {
+            const run = doubtRun.current.count;
+            setDoubt(doubtVerdict(body.doubt, body.item.codeAsRead, run));
+            /*
+             * Once per run, not once per read. This beep means "something has
+             * started going wrong" about a parcel the phone had nothing to say
+             * about when it was scanned — and re-reading the same box starts
+             * nothing, so it stays quiet.
+             */
+            if (before === 0 && run === 1) beepWrongWay();
+          }
         }
       }
     } finally {
@@ -328,10 +349,26 @@ export function ScannerApp({
      */
     const instant = doubtFromCode(code, direction);
 
+    /*
+     * THE PHONE COUNTS EVERY READ IT CAN SETTLE, good or bad — which in this
+     * direction may be all of them. This is the only place in the app that
+     * sees every read exactly once, synchronously, in the order the worker
+     * scanned them, and that is what makes "three in a row" mean three in a
+     * row. Where the phone can settle a read, `flush` leaves the run alone.
+     */
+    if (phoneSettlesEveryRead(direction)) {
+      doubtRun.current = afterRead(doubtRun.current, code.raw, instant !== null);
+    }
+
     if (instant) {
+      /*
+       * Every scan of a wrong-way box gets its own beep, even the same box
+       * twice. This is not the "a run has started" beep that `flush` plays: it
+       * is the answer to the scan the worker just made, with the box still in
+       * their hand, and a scan that answers nothing is a scan they make again.
+       */
       beepWrongWay();
       setFlash({ kind: 'wrong-way', base: code.base, at: Date.now() });
-      doubtRun.current = afterRead(doubtRun.current, read.readId, true);
       setDoubt(doubtVerdict(instant, code.raw, doubtRun.current.count));
     } else if (already) {
       beepDuplicate();
@@ -531,6 +568,13 @@ export function ScannerApp({
     setSaved(null);
     setItems([]);
     setProblem(null);
+    /*
+     * The banner and its run belong to the batch that was just finished. A new
+     * batch that opened still wearing them would offer to re-file a pile it
+     * had not seen one parcel of.
+     */
+    setDoubt(null);
+    doubtRun.current = NO_DOUBT_RUN;
     batchIdRef.current = null;
     setBatchId(null);
     void ensureBatch();

@@ -5,9 +5,10 @@ import { scanBatches, scans } from '@/db/schema';
 import { readFileSync } from 'node:fs';
 import { parseCorreosCode } from '@/lib/scan/codes';
 import {
-  DOUBT_RUN, NO_DOUBT_RUN, afterRead, alreadyCounted, doubtFromCode, doubtFromParcel,
-  type DirectionDoubt,
+  DOUBT_RUN, NO_DOUBT_RUN, afterRead, doubtFromCode, doubtFromParcel,
+  phoneSettlesEveryRead, type DirectionDoubt,
 } from '@/lib/scan/direction';
+import type { ScanDirection } from '@/lib/scan/model';
 import {
   addScan, moveBatchDirection, moveScanDirection, openBatch, switchBatchDirection,
 } from '@/lib/scan/batches';
@@ -62,7 +63,15 @@ describe('the verdict the phone can reach on its own', () => {
 
     expect(verdict?.doubt).toBe('return-in-outgoing');
     expect(verdict?.shouldBe).toBe('incoming');
-    expect(verdict?.message).toContain('return label');
+    /*
+     * NOT `toContain('return label')`, which is what this asked for until the
+     * banner had a title of its own. The title names the return label now and
+     * the message carries the consequence, so asking for the label here is
+     * asking for the stutter back — see `what the wrong-way banner says`,
+     * which holds the two lines together and forbids any overlap.
+     */
+    expect(verdict?.message).toMatch(/came back/i);
+    expect(verdict?.message).not.toMatch(/return label/i);
   });
 
   it('says nothing about a return label scanned the right way round', () => {
@@ -337,82 +346,216 @@ describe('what the wrong-way banner says', () => {
   });
 });
 
-describe('counting the reads that look wrong', () => {
-  type Read = {
-    id: string;
-    /** The phone settled it from the code: a DX label in an Outgoing batch. */
-    instant: boolean;
-    /** What the server said when the read came back, or nothing yet. */
-    flush?: boolean;
-  };
+describe('counting the parcels that look wrong', () => {
+  const SCREEN = readFileSync('components/scan/ScannerApp.tsx', 'utf8');
 
-  function shift(reads: readonly Read[]): { count: number; beeps: string[] } {
+  /*
+   * FIRST, THAT THE SCREEN STILL WORKS THE WAY THE DRIVER BELOW PRETENDS IT
+   * DOES. The driver is a hand-written copy of two paths through
+   * ScannerApp.tsx, and a copy is worth nothing once the original moves. What
+   * cannot move without breaking everything is the shape: each read is
+   * counted in exactly one place, and that place asks whose job it is first.
+   */
+  it('advances the run in exactly two places, each asking whose job it is', () => {
+    const sites = [...SCREEN.matchAll(/doubtRun\.current = afterRead\(/g)].map((m) => m.index!);
+    expect(sites, 'one place per direction: the phone for Outgoing, the server for Incoming')
+      .toHaveLength(2);
+
+    const negated = sites.map((at) => {
+      const before = SCREEN.slice(Math.max(0, at - 400), at);
+      const asked = before.lastIndexOf('phoneSettlesEveryRead(direction)');
+      expect(asked, 'every place that advances the run asks `phoneSettlesEveryRead` first')
+        .toBeGreaterThan(-1);
+      return before.charAt(asked - 1) === '!';
+    });
+    // One of the two guards is negated and one is not, so exactly one of the
+    // passes owns any given read. Both negated, or neither, is the old bug.
+    expect([...negated].sort()).toEqual([false, true]);
+  });
+
+  /**
+   * A phone, driven read by read.
+   *
+   * `take` is what happens with the box in the worker's hand. `answer` is the
+   * server's reply landing later, and it is a SEPARATE step on purpose: the
+   * gap between them is where the double beep lived, and the driver this
+   * replaced answered every read inside the same loop turn that took it, so
+   * it could not express a run of three boxes with a good box's answer
+   * arriving in the middle. It called that "the interleaving" and never built
+   * one.
+   */
+  function phone(direction: ScanDirection) {
     let run = NO_DOUBT_RUN;
     const beeps: string[] = [];
-    for (const r of reads) {
-      if (r.instant) {
-        run = afterRead(run, r.id, true);
-        beeps.push(`${r.id}:phone`);
-      }
-      if (r.flush !== undefined) {
-        const beeped = alreadyCounted(run, r.id);
-        run = afterRead(run, r.id, r.flush);
-        if (r.flush && !beeped && run.count === 1) beeps.push(`${r.id}:server`);
-      }
-    }
-    return { count: run.count, beeps };
+    let banner: { code: string; run: number } | null = null;
+
+    return {
+      /** `take`: the phone settles what the code alone can settle. */
+      take(code: string, returnLabel: boolean) {
+        const instant = returnLabel && direction === 'outgoing';
+        if (phoneSettlesEveryRead(direction)) run = afterRead(run, code, instant);
+        if (instant) {
+          beeps.push(`${code}:phone`);
+          banner = { code, run: run.count };
+        }
+      },
+      /** `flush`: the server's reply for one read, whenever it comes back. */
+      answer(code: string, doubted: boolean) {
+        if (phoneSettlesEveryRead(direction)) return;
+        const before = run.count;
+        run = afterRead(run, code, doubted);
+        if (doubted) {
+          banner = { code, run: run.count };
+          if (before === 0 && run.count === 1) beeps.push(`${code}:server`);
+        }
+      },
+      /** "Just this one parcel". */
+      dismiss() { banner = null; run = NO_DOUBT_RUN; },
+      get count() { return run.count; },
+      get beeps() { return beeps; },
+      /** Whether the banner is claiming a whole pile is in the wrong mode. */
+      get pile() { return banner !== null && banner.run >= DOUBT_RUN; },
+      get shown() { return banner; },
+    };
   }
 
-  /** A DX return label read into an Outgoing batch: both halves fire. */
-  const DX = (id: string): Read => ({ id, instant: true, flush: true });
-  /** An ordinary label the server doubts: only the server fires. */
-  const FROM_SERVER = (id: string): Read => ({ id, instant: false, flush: true });
-  /** A read the server was happy with. */
-  const GOOD = (id: string): Read => ({ id, instant: false, flush: false });
+  const DX = 'DXA6TP9800129340128012S';
+  const DX2 = 'DXA6TP9800129340128013T';
+  const DX3 = 'DXA6TP9800129340128014U';
 
-  it('counts one DX label as one parcel, and beeps once', () => {
-    expect(shift([DX('a')])).toEqual({ count: 1, beeps: ['a:phone'] });
-  });
-
-  it('counts two DX labels as two, not three', () => {
-    // The whole bug, in one line.
-    expect(shift([DX('a'), DX('b')]).count).toBe(2);
-  });
-
-  it('beeps once per parcel, never twice for one box', () => {
-    expect(shift([DX('a'), DX('b')]).beeps).toEqual(['a:phone', 'b:phone']);
+  it('counts one wrong box as one parcel, and beeps once', () => {
+    const p = phone('outgoing');
+    p.take(DX, true);
+    expect(p.count).toBe(1);
+    expect(p.beeps).toEqual([`${DX}:phone`]);
+    expect(p.pile).toBe(false);
   });
 
   it('offers the whole-batch switch on the third parcel, not the second', () => {
-    expect(shift([DX('a'), DX('b')]).count).toBeLessThan(DOUBT_RUN);
-    expect(shift([DX('a'), DX('b'), DX('c')]).count).toBe(DOUBT_RUN);
+    const p = phone('outgoing');
+    p.take(DX, true);
+    p.take(DX2, true);
+    expect(p.pile).toBe(false);
+    p.take(DX3, true);
+    expect(p.count).toBe(DOUBT_RUN);
+    expect(p.pile).toBe(true);
   });
 
-  it('counts a read that had to be sent twice once', () => {
-    // A lost response: the phone counted it, then the queue resent the same
-    // readId and the server answered the same verdict both times.
-    const resent: Read[] = [
-      { id: 'a', instant: true },
-      { id: 'a', instant: false, flush: true },
-      { id: 'a', instant: false, flush: true },
-    ];
-    expect(shift(resent)).toEqual({ count: 1, beeps: ['a:phone'] });
+  it('counts one box scanned three times as one parcel, not a pile', () => {
+    /*
+     * The banner says "do not scan it again", and a worker can still scan it
+     * again — the duplicate beep is a feature of this screen, so re-reads are
+     * expected. Counting reads instead of parcels offered to re-file a whole
+     * batch of sixty because one box had been waved at the camera three times.
+     */
+    const p = phone('outgoing');
+    p.take(DX, true);
+    p.take(DX, true);
+    p.take(DX, true);
+    expect(p.count).toBe(1);
+    expect(p.pile).toBe(false);
+    // Three scans, three beeps: that half is right. Each scan is an action the
+    // worker took, and an action with no answer is one they take again.
+    expect(p.beeps).toHaveLength(3);
   });
 
-  it('still counts one per read when only the server doubts it', () => {
-    // The 20 and 25 November case, which the phone cannot see coming.
-    expect(shift([FROM_SERVER('a'), FROM_SERVER('b'), FROM_SERVER('c')]).count).toBe(3);
-    expect(shift([FROM_SERVER('a')]).beeps).toEqual(['a:server']);
+  it('does not beep again, or lose its count, when a good box is answered mid-run', () => {
+    /*
+     * THE OFFLINE CASE, which is most of a warehouse morning. Four boxes are
+     * scanned with no signal — an ordinary one, then three return labels — and
+     * the whole queue is answered at once when the signal comes back. The
+     * queue is oldest-first, so the ordinary box is answered FIRST, after all
+     * three return labels have already been counted.
+     *
+     * That answer used to reset the run, so the next answer looked like a
+     * fresh one: it beeped a second time for a box the worker had already been
+     * warned about, and walked "that is 3 in a row" down to 1 and back up to 3
+     * while the Switch button sat still underneath it.
+     */
+    const p = phone('outgoing');
+    p.take('PKA6TP9800129340147006H', false);
+    p.take(DX, true);
+    p.take(DX2, true);
+    p.take(DX3, true);
+    expect(p.count).toBe(3);
+
+    p.answer('PKA6TP9800129340147006H', false);
+    p.answer(DX, true);
+    p.answer(DX2, true);
+    p.answer(DX3, true);
+
+    expect(p.count).toBe(3);
+    expect(p.pile).toBe(true);
+    expect(p.beeps).toEqual([`${DX}:phone`, `${DX2}:phone`, `${DX3}:phone`]);
   });
 
-  it('starts again after a read the server was happy with', () => {
-    expect(shift([DX('a'), GOOD('g')]).count).toBe(0);
-    expect(shift([DX('a'), DX('b'), GOOD('g'), DX('c')]).count).toBe(1);
+  it('keeps a dismissed parcel dismissed when its own answer comes back', () => {
+    // The worker said "just this one parcel". The answer for that same read is
+    // still on its way, and it must not undo what they just said.
+    const p = phone('outgoing');
+    p.take(DX, true);
+    p.dismiss();
+    p.answer(DX, true);
+    expect(p.shown).toBeNull();
+    expect(p.count).toBe(0);
+    expect(p.beeps).toEqual([`${DX}:phone`]);
+  });
+
+  it('starts again after a box that looked fine', () => {
+    const p = phone('outgoing');
+    p.take(DX, true);
+    p.take(DX2, true);
+    p.take('PKA6TP9800129340147006H', false);
+    p.take(DX3, true);
+    // Three scattered through sixty is not a pile.
+    expect(p.count).toBe(1);
+    expect(p.pile).toBe(false);
+  });
+
+  it('lets the server count the parcels the phone cannot see coming', () => {
+    // The 20 and 25 November case: ordinary labels read IN, which the phone
+    // has nothing to say about, and only the parcel's state contradicts.
+    const p = phone('incoming');
+    for (const code of ['one', 'two', 'three']) p.take(code, false);
+    expect(p.count).toBe(0);
+    for (const code of ['one', 'two', 'three']) p.answer(code, true);
+    expect(p.count).toBe(3);
+    expect(p.pile).toBe(true);
+    // One beep for the run, not one per parcel: by the time these land the
+    // box is out of the worker's hand and the banner is doing the talking.
+    expect(p.beeps).toEqual(['one:server']);
+  });
+
+  it('does not beep again when the same wrong parcel is read in twice', () => {
+    const p = phone('incoming');
+    p.take('one', false);
+    p.answer('one', true);
+    p.take('one', false);
+    p.answer('one', true);
+    expect(p.count).toBe(1);
+    expect(p.beeps).toEqual(['one:server']);
   });
 
   it('holds nothing before the first read', () => {
     expect(NO_DOUBT_RUN.count).toBe(0);
-    expect(alreadyCounted(NO_DOUBT_RUN, 'a')).toBe(false);
+    expect(NO_DOUBT_RUN.parcels).toEqual([]);
     expect(afterRead(NO_DOUBT_RUN, 'a', false)).toEqual(NO_DOUBT_RUN);
+  });
+
+  it('knows which end settles a read, and says so in one place', () => {
+    /*
+     * The fact the whole arrangement rests on: in an Outgoing batch the server
+     * agrees with the phone by construction (`doubtFromParcel` returns
+     * `doubtFromCode` and then gives up unless the direction is `incoming`),
+     * so the phone may count alone; in an Incoming batch the phone can reach
+     * no verdict at all, so the server must.
+     */
+    expect(phoneSettlesEveryRead('outgoing')).toBe(true);
+    expect(phoneSettlesEveryRead('incoming')).toBe(false);
+
+    const dx = parseCorreosCode(DX)!;
+    expect(doubtFromParcel(dx, 'outgoing', { state: 'delivered' }))
+      .toEqual(doubtFromCode(dx, 'outgoing'));
+    expect(doubtFromCode(parseCorreosCode(OUT)!, 'incoming')).toBeNull();
   });
 });
