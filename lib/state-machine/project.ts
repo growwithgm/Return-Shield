@@ -16,6 +16,62 @@ import type { EventLeg } from '@/lib/carriers/correos/return-code';
  */
 export const PRE_ADMISSION_CODE = 'A090000V';
 
+/**
+ * What one event on the RETURN LEG means for the parcel.
+ *
+ * The whole of it: somebody took the box, or they did not yet. Exported
+ * because the Settings Correos test has to answer the same question about a
+ * `DX` code typed into its box, and two answers to "what does this event mean
+ * on the way back" is one too many — the screen would say "Delivered" about a
+ * parcel that is on our own shelf, which is the exact mistake this feature
+ * exists to end.
+ *
+ * `collected` as well as `delivered`. Both mean somebody took it, and on this
+ * leg that somebody is us. Reading only `delivered` would leave a parcel
+ * handed over at a counter in "Coming back" for ever.
+ *
+ * Anything else — in transit, out for delivery, a failed attempt at OUR door,
+ * sitting at an office waiting for us — is the parcel still on its way back,
+ * and that is all a single event is allowed to say. The leg's own `returnedAt`
+ * is decided across all of its events, below, not from any one of them.
+ */
+export function returnLegMeans(
+  mappedState: ShipmentState | null,
+): 'returned' | 'returning' {
+  return mappedState === 'delivered' || mappedState === 'collected' ? 'returned' : 'returning';
+}
+
+/**
+ * What a WHOLE return leg says, which is not what its newest event says.
+ *
+ * Two ways those differ, and the catch-up will produce both:
+ *
+ *   A HANDOVER THAT IS NOT THE NEWEST EVENT. Correos go on scanning after they
+ *   have delivered something — `canTransition` exists because they do — so a
+ *   leg can read "Clasificado" after "Entregado". The loop below keeps
+ *   `returnedAt` from ANY handover and lets it beat `returnStartedAt`
+ *   unconditionally, because a leg that has both is a leg that finished. A
+ *   reader that looked only at the newest event would say "still on its way
+ *   back" about a parcel on our own shelf.
+ *
+ *   A NEWEST EVENT WITH NO MAPPING. The leg counts as started from any event,
+ *   mapped or not — see `returnStartedAt` below, set before the mapping is
+ *   even looked at — because a code Correos answered about at all is a return
+ *   that exists. The return leg's own wordings are the ones nobody has mapped
+ *   yet ("Devolución admitida"), so this is the common case, not the odd one.
+ *
+ * Exported for the Settings Correos test, which has to answer the same
+ * question about a `DX` code typed into its box and must not answer it
+ * differently from the parcel. Null for no events at all: Correos know the
+ * code and have said nothing about it, and that is not a reading.
+ */
+export function returnLegReads(
+  mappedStates: readonly (ShipmentState | null)[],
+): 'returned' | 'returning' | null {
+  if (!mappedStates.length) return null;
+  return mappedStates.some((m) => returnLegMeans(m) === 'returned') ? 'returned' : 'returning';
+}
+
 export interface ProjectableEvent {
   eventCode: string;
   eventDesc: string;
@@ -108,13 +164,8 @@ export function project(events: readonly ProjectableEvent[]): Projection {
       // The return has at least started. The earliest event on the leg is when
       // Correos created it, which is the honest "coming back since".
       if (!returnStartedAt || ev.occurredAt < returnStartedAt) returnStartedAt = ev.occurredAt;
-      /*
-       * `collected` as well as `delivered`. Both mean somebody took it, and on
-       * this leg that somebody is us. Reading only `delivered` would leave a
-       * parcel handed over at a counter stuck in "Coming back" for ever —
-       * which is the exact failure this whole feature exists to end.
-       */
-      if (ev.mappedState === 'delivered' || ev.mappedState === 'collected') {
+      // `returnLegMeans` above, so the Settings test and this cannot drift.
+      if (returnLegMeans(ev.mappedState) === 'returned') {
         if (!returnedAt || ev.occurredAt > returnedAt) returnedAt = ev.occurredAt;
       }
       continue;

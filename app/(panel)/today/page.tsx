@@ -4,7 +4,6 @@ import { ParcelTable } from '@/components/ParcelTable';
 import { FocusCard } from '@/components/FocusCard';
 import { RestockAll } from '@/components/RestockAll';
 import { SectionHeading, Empty } from '@/components/ui';
-import { money } from '@/lib/escalation/decide';
 
 // Per-request, behind a login or a signed token, and it reads the database.
 // Saying so explicitly keeps it out of the build's static render pass, which
@@ -62,12 +61,18 @@ export default async function TodayPage({
         <div className="mt-[22px]">
           <div className="flex flex-wrap items-center gap-3 rounded-[5px] border border-line border-l-4 border-l-crit bg-surface px-4 py-[14px]">
             <div className="min-w-[220px] flex-1">
+              {/*
+                * A decided string, not a sum done in JSX. The pile is two
+                * groups now — some of these parcels are on a shelf in the
+                * building and some are still with Correos — and which is
+                * which is lib/views/rows.ts's job, not this file's.
+                */}
               <div className="text-[14.5px] font-semibold text-ink">
-                {view.comingBack.length} parcels coming back —{' '}
-                {money(view.comingBack.reduce((a, s) => a + s.valueCents, 0))} total
+                {view.restockLine}
               </div>
               <div className="mt-[3px] text-[12.5px] text-muted">
-                Same job for all of them: log them back into stock as they land.
+                Same job for all of them: log them back into stock. The ones already
+                here can be done now.
               </div>
             </div>
             <Link

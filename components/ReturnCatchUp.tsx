@@ -4,7 +4,19 @@ import { useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import { catchUpReturns, previewReturns } from '@/app/actions/returns';
 import type { ReturnCatchUpPreview, ReturnCatchUpResult } from '@/lib/shipments/return-catchup';
-import { describeProbe } from '@/lib/shipments/return-leg';
+/*
+ * `return-probe`, NOT `return-leg`, and this is a load-bearing import path.
+ *
+ * This file is `'use client'`, so every VALUE it imports is bundled for the
+ * browser. `describeProbe` used to come from `lib/shipments/return-leg.ts`,
+ * which imports the database pool — and through `lib/alerts` the mailer — so
+ * webpack followed it and `next build` stopped with
+ * `UnhandledSchemeError: Reading from "node:async_hooks"`. The typecheck
+ * passed; only the build knew. `tests/client-bundle.test.ts` refuses it now.
+ *
+ * The type imports above are erased at compile time and reach no bundle.
+ */
+import { describeProbe } from '@/lib/shipments/return-probe';
 
 /**
  * "Find the parcels that already came back."

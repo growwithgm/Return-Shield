@@ -18,7 +18,11 @@ const { CorreosTokenProvider, setCorreosToken, clearTokenCache } =
   await import('@/lib/carriers/correos/token');
 const { getSetting, setSetting } = await import('@/lib/settings');
 const { resetDb, closeDb } = await import('./helpers/db');
-const { REAL_SEARCH_RESPONSE, REAL_CODE, v2Shipment, v2Event } = await import('./helpers/correos');
+const {
+  REAL_SEARCH_RESPONSE, REAL_CODE, RETURN_STARTED_RESPONSE, RETURN_LEG_RESPONSE,
+  RETURN_ORIGINAL, RETURN_CODE, v2Shipment, v2Event,
+} = await import('./helpers/correos');
+const { makeShipment } = await import('./helpers/fixtures');
 
 /**
  * The button exists because four variables from two different places have to be
@@ -309,6 +313,164 @@ describe('what it says when the lookup works', () => {
 
     expect(result.lookup?.ok).toBe(false);
     expect(result.lookup?.message).toContain('Envío no encontrado');
+  });
+});
+
+/* ------------------------------------------------- step 3: the second code */
+
+describe('step 3: which code it comes back under', () => {
+  /*
+   * THE STEP THIS SCREEN DID NOT HAVE, and the reason the operator had to go
+   * to Correos' own tracker to find out that a parcel delivered back to the
+   * warehouse on 19 November still read "Wrong address, 18 Nov" here.
+   */
+  it('names the return code Correos themselves named', async () => {
+    stubNetwork([{ body: RETURN_STARTED_RESPONSE }]);
+
+    const result = await testCorreosConnection(RETURN_ORIGINAL);
+
+    expect(result.returnLeg?.isReturn).toBe(false);
+    expect(result.returnLeg?.code).toBe(RETURN_CODE);
+    expect(result.returnLeg?.source).toBe('correos');
+    expect(result.returnLeg?.message).toContain('Correos named the return themselves');
+    // Our own arithmetic agrees with theirs, which is what makes the derived
+    // codes in the catch-up trustworthy. See lib/carriers/correos/return-code.ts.
+    expect(result.returnLeg?.message).toContain('agrees');
+  });
+
+  it('works the code out when Correos has not named one', async () => {
+    stubNetwork([{ body: [shipment(RETURN_ORIGINAL, 'En reparto', 'REPA')] }]);
+
+    const result = await testCorreosConnection(RETURN_ORIGINAL);
+
+    expect(result.returnLeg?.code).toBe(RETURN_CODE);
+    expect(result.returnLeg?.source).toBe('derived');
+    expect(result.returnLeg?.postcode).toBe('28012');
+    // A guess, and the screen says so rather than presenting arithmetic as a
+    // fact: the chip beside it reads "works, but".
+    expect(result.returnLeg?.message).toContain('RETURN_POSTCODE 28012');
+  });
+
+  it('says plainly when nothing can be worked out', async () => {
+    stubNetwork([{ body: [shipment('ORDER-12345', 'En reparto', 'REPA')] }]);
+
+    const result = await testCorreosConnection('ORDER-12345');
+
+    expect(result.returnLeg?.code).toBeNull();
+    expect(result.returnLeg?.message).toContain('not a 23-character');
+  });
+
+  /*
+   * AND THE OTHER DIRECTION: a DX code typed into the box.
+   *
+   * Every one of its events is a return-leg event, and the mapper does not
+   * know that — it reads a sentence, not a leg. So "Entregado" mapped to
+   * `delivered` and step 2 said "Reads as: Delivered" about a parcel sitting
+   * on our own shelf.
+   */
+  it('reads a return code the way the parcel will, not the way the customer would', async () => {
+    stubNetwork([{ body: RETURN_LEG_RESPONSE }]);
+
+    const result = await testCorreosConnection(RETURN_CODE);
+
+    expect(result.lookup?.ok).toBe(true);
+    expect(result.lookup?.state).toBe('Back with us (Returned)');
+    expect(result.lookup?.state).not.toContain('Delivered');
+
+    // And every row of the list, which had the identical problem — the
+    // operator only noticed the summary line.
+    const states = (result.lookup?.timeline ?? []).map((e) => e.state);
+    expect(states).toContain('Back with us');
+    expect(states).toContain('In transit back to us');
+    expect(states).toContain('On its way back to us');
+    expect(states).toContain('Return accepted by Correos');
+    expect(states).not.toContain('Delivered');
+    expect(states).not.toContain('Out for delivery');
+    expect(states).not.toContain('Pre-admission (label made, not handed to Correos)');
+  });
+
+  it('says whose return leg it is, when the parcel is one of ours', async () => {
+    await makeShipment({
+      shippingCode: RETURN_ORIGINAL,
+      state: 'returning',
+      returnCode: RETURN_CODE,
+      returnCodeSource: 'correos',
+    });
+    stubNetwork([{ body: RETURN_LEG_RESPONSE }]);
+
+    const result = await testCorreosConnection(RETURN_CODE);
+
+    expect(result.returnLeg?.isReturn).toBe(true);
+    expect(result.returnLeg?.message).toContain(`return leg of ${RETURN_ORIGINAL}`);
+  });
+
+  it('says so when a return code belongs to no parcel here', async () => {
+    stubNetwork([{ body: RETURN_LEG_RESPONSE }]);
+
+    const result = await testCorreosConnection(RETURN_CODE);
+
+    expect(result.returnLeg?.isReturn).toBe(true);
+    expect(result.returnLeg?.stored).toBeNull();
+    expect(result.returnLeg?.message).toContain('no parcel here is expecting it');
+  });
+
+  /*
+   * THE WHOLE LEG ANSWERS, NOT ITS NEWEST EVENT, and these two are the cases
+   * that tell them apart. Both will occur across sixty-nine parcels.
+   */
+  it('still reads the parcel as back when Correos scan on after the handover', async () => {
+    // Correos do carry on scanning after they have delivered something —
+    // `canTransition` exists because they do. The projection keeps a handover
+    // from ANY event of the leg; a screen reading only the newest would say
+    // "still on its way back" about a parcel on our own shelf.
+    stubNetwork([{
+      body: [v2Shipment(RETURN_CODE, [
+        v2Event('I01E010V', 'Entregado', 'ENTREGADO', { date: '19/11/2026', hours: '09:37:00' }),
+        v2Event('P040000V', 'Clasificado', 'EN CAMINO', { date: '19/11/2026', hours: '18:02:00' }),
+      ])],
+    }]);
+
+    const result = await testCorreosConnection(RETURN_CODE);
+
+    expect(result.lookup?.state).toBe('Back with us (Returned)');
+  });
+
+  it('reads a leg whose newest event nobody has mapped as still on its way', async () => {
+    /*
+     * The COMMON case, not the odd one: the return leg's own wordings
+     * ("Devolución admitida") are the ones nobody has mapped. The projection
+     * counts the leg as started from any event, mapped or not, so the parcel
+     * reads "Coming back" — and a screen reading only the newest event would
+     * print no line at all.
+     */
+    stubNetwork([{
+      body: [v2Shipment(RETURN_CODE, [
+        v2Event('ZZ998', 'Una cosa nueva en la devolución', 'SIN FASE'),
+      ])],
+    }]);
+
+    const result = await testCorreosConnection(RETURN_CODE);
+
+    expect(result.lookup?.state).toBe('Still on its way back to us (Coming back)');
+    // And the row itself still says plainly that we have no mapping for it.
+    expect(result.lookup?.timeline?.[0].state).toBeNull();
+    expect(result.lookup?.message).toContain('no mapping');
+  });
+
+  /*
+   * THE ANSWER NOBODY HAS YET. The DX codes were read off Correos' PUBLIC
+   * tracker, which is a different service from the trackpub /search this
+   * system uses. A refusal has to be reportable rather than silent, because
+   * this screen is how it gets found out.
+   */
+  it('still answers step 3 when Correos refuses the code outright', async () => {
+    stubNetwork([{ status: 403, body: 'nope' }]);
+
+    const result = await testCorreosConnection(RETURN_CODE);
+
+    expect(result.lookup?.ok).toBe(false);
+    expect(result.returnLeg?.isReturn).toBe(true);
+    expect(result.returnLeg?.code).toBe(RETURN_CODE);
   });
 });
 

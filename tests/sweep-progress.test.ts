@@ -234,7 +234,11 @@ describe('a real sweep, end to end', () => {
   /** A trackpub that answers nothing, for codes we only want counted. */
   function quiet() {
     const empty = (): LookupResult => ({
-      ok: true, outcome: { events: [], problems: [], errors: [], codesSeen: [] }, raw: {},
+      ok: true,
+      // See the note in tests/reconcile.test.ts: `associated` is required so a
+      // mock cannot silently stop finding return codes.
+      outcome: { events: [], associated: [], problems: [], errors: [], codesSeen: [] },
+      raw: {},
     });
     setTrackpub({
       configured: true,

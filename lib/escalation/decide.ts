@@ -1,6 +1,6 @@
 import type { ShipmentState } from '@/lib/state-machine/states';
 import { RETURN_STATES } from '@/lib/state-machine/states';
-import { daysAtOffice, OFFICE_CRIT_DAYS, OFFICE_WARN_DAYS } from '@/lib/time';
+import { daysAtOffice, OFFICE_CRIT_DAYS, OFFICE_WARN_DAYS, shortDate } from '@/lib/time';
 import { now } from '@/lib/clock';
 
 /**
@@ -35,6 +35,17 @@ export interface DecidableShipment {
    */
   officeArrivedAt: Date | null;
   officeName: string | null;
+  /**
+   * When Correos delivered the return back to US, from the return leg's own
+   * delivery event. See lib/state-machine/project.ts.
+   *
+   * Here because the reason line for a parcel that is BACK is the day it
+   * landed, and this is the only date that says so: `officeArrivedAt` is the
+   * outbound counter, and `lastEventAt` is the newest event of any kind on
+   * either leg. Null for the great majority of parcels, which never come back,
+   * and null on a `returned` row reached some way other than the projection.
+   */
+  returnedAt: Date | null;
   town: string;
   customerName: string;
   valueCents: number;
@@ -147,9 +158,7 @@ export function nextAction(s: DecidableShipment, at: Date = now()): NextAction |
        * promising something nobody had wired up.
        */
       label: 'Mark as back in stock',
-      why: s.state === 'returning'
-        ? `Correos is sending it back from ${s.officeName ?? 'the post office'}`
-        : "Customer didn't want it",
+      why: whyComingBack(s),
       kind: 'restock',
       tone: 'navy',
       needsConfirm: false,
@@ -223,6 +232,60 @@ export function nextAction(s: DecidableShipment, at: Date = now()): NextAction |
   }
 
   return null;
+}
+
+/**
+ * The reason line for a parcel on its way back, or already back.
+ *
+ * THREE RETURN STATES, AND THIS LINE USED TO SAY TWO THINGS. `RETURN_STATES`
+ * holds `returning`, `returned` and `refused`, and the text was split in two:
+ * `returning` got "Correos is sending it back", and everything else got
+ * "Customer didn't want it". Until the return leg existed no parcel had ever
+ * reached `returned`, so that second branch was only ever read by genuinely
+ * refused parcels and it was right. The catch-up puts about sixty-nine
+ * `returned` parcels on Today at once, and most of them came back on
+ * "Dirección incorrecta" or because nobody collected them in time. Nobody
+ * said no at the door.
+ *
+ * WHAT THIS CAN SAY. That the parcel is here, and the day it got here:
+ * `returnedAt` is the return leg's own delivery event, and it is the one fact
+ * that tells a parcel to look for on a shelf from one to expect. That the
+ * customer refused it, for `refused` — which is Correos' own word for that
+ * state, so it is their claim and not ours. And that a return has started,
+ * for `returning`.
+ *
+ * WHAT IT CANNOT, AND SO DOES NOT. WHY a return started is not on this row.
+ * The projection overwrites `state` and `state_since` the moment a parcel
+ * moves, so a `returned` parcel no longer remembers it was `bad_address` or
+ * `at_office`, and the sentence Correos sent with the return lives on
+ * `shipment_events`, which this function never sees. A wrong address and an
+ * expired collection window are therefore the same thing from here. So is a
+ * refusal that has since come back, which reads `returned` like any other —
+ * `canTransition` lets `refused -> returned` through on purpose.
+ * `lib/shipments/ingest.ts` can name a reason (`whyBack`) only because the
+ * transition hands it the state the parcel came from; nothing hands one here.
+ *
+ * NO INVENTED DATE AND NO INVENTED PLACE. A `returned` row with no
+ * `returnedAt` says only that the parcel is here — `reproject` writes the
+ * state and the date in one statement, so that is a row somebody corrected by
+ * hand. And "from {office}" only when Correos named one: the line this
+ * replaced fell back to "the post office", which for every return that
+ * started with a wrong address named an office the parcel had never been to.
+ */
+function whyComingBack(
+  s: Pick<DecidableShipment, 'state' | 'officeName' | 'returnedAt'>,
+): string {
+  if (s.state === 'refused') return "Customer didn't want it";
+
+  if (s.state === 'returned') {
+    return s.returnedAt
+      ? `Correos delivered it back to us on ${shortDate(s.returnedAt)}`
+      : 'It is back with us';
+  }
+
+  return s.officeName
+    ? `Correos is sending it back from ${s.officeName}`
+    : 'Correos is sending it back';
 }
 
 /** Quiet until a re-check — on nobody's list in the meantime. */

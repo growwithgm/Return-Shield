@@ -160,6 +160,10 @@ async function loadRowsQuery(opts: { at?: Date } = {}): Promise<ShipmentRow[]> {
       state: r.state as ShipmentState,
       officeArrivedAt: r.officeArrivedAt,
       officeName: r.officeName,
+      // The DECISION needs this, not only the row: the reason line for a
+      // parcel that is back says the day it landed, and `nextAction` is
+      // handed this literal rather than the row it is built from.
+      returnedAt: r.returnedAt,
       town: r.city ?? '',
       // The label, so every screen and every alert says something useful about
       // a parcel with no customer name. See lib/orders/customer-label.ts.
@@ -283,6 +287,13 @@ export interface TodayView {
   digest: string[];
   focus: ShipmentRow | null;
   comingBack: ShipmentRow[];
+  /**
+   * The heading above "Mark as back in stock": the digest's split again, on
+   * one line, because that strip is one row with one button over the whole
+   * pile. Decided here rather than in the page, which used to filter and sum
+   * cents in JSX against this file's own contract above.
+   */
+  restockLine: string;
   doneToday: number;
   totalToday: number;
   progressLabel: string;
@@ -298,6 +309,33 @@ export async function todayView(focusIndex = 0, at: Date = now()): Promise<Today
     (r.state === 'returning' || r.state === 'refused' || r.state === 'returned')
     && !r.restocked && !r.dropped);
 
+  /*
+   * ONE PILE, TWO PLACES, SO TWO LINES.
+   *
+   * Until the return leg landed, nothing in this database had ever reached
+   * `returned`, so one sentence covered the whole pile and "coming back" was
+   * true of all of it. It is not true of the sixty-nine the catch-up is about:
+   * Correos delivered their return code back to our door, the box is on a
+   * shelf in the building, and telling the operator it is "coming back" sends
+   * them to wait for a parcel they could go and fetch.
+   *
+   * The JOB is the same for both halves — log the stock back in, which is why
+   * they share `comingBack`, the Mark-as-back-in-stock button and the to-do
+   * count — and the DAY is not, which is why the counts and the two money
+   * figures are separate. One total over both answers neither "what can I put
+   * away this morning" nor "what is still out there".
+   *
+   * Split on `!== 'returned'` rather than by naming the other two states, so
+   * the halves stay exhaustive of `comingBack` however that filter changes.
+   *
+   * And on the STATE, not on `returnedAt`: a `returned` row reached by a hand
+   * correction has no date, and that parcel must not fall quietly into
+   * "coming back". `state` is what the projection writes.
+   */
+  const stillComing = comingBack.filter((r) => r.state !== 'returned');
+  const backWithUs = comingBack.filter((r) => r.state === 'returned');
+  const cents = (rows: ShipmentRow[]) => rows.reduce((a, s) => a + s.valueCents, 0);
+
   const doneToday = await countDoneToday(at);
 
   const digest: string[] = [];
@@ -310,9 +348,14 @@ export async function todayView(focusIndex = 0, at: Date = now()): Promise<Today
       + (calls.length > 3 ? ` and ${calls.length - 3} more` : ''),
     );
   }
-  if (comingBack.length) {
-    const total = comingBack.reduce((a, s) => a + s.valueCents, 0);
-    digest.push(`${comingBack.length} parcels coming back — ${money(total)} to put back in stock.`);
+  if (stillComing.length) {
+    digest.push(`${stillComing.length} ${stillComing.length === 1 ? 'parcel' : 'parcels'} coming back`
+      + ` — ${money(cents(stillComing))} to put back in stock when `
+      + `${stillComing.length === 1 ? 'it lands' : 'they land'}.`);
+  }
+  if (backWithUs.length) {
+    digest.push(`${backWithUs.length} ${backWithUs.length === 1 ? 'parcel' : 'parcels'} back with us`
+      + ` — ${money(cents(backWithUs))} to put back in stock now.`);
   }
   const other = act.length - calls.length - comingBack.length;
   if (other > 0) digest.push(`${other} other thing${other === 1 ? '' : 's'} need${other === 1 ? 's' : ''} you.`);
@@ -330,6 +373,16 @@ export async function todayView(focusIndex = 0, at: Date = now()): Promise<Today
     digest,
     focus: act.length ? act[focusIndex % act.length] : null,
     comingBack,
+    restockLine: [
+      stillComing.length
+        ? `${stillComing.length} ${stillComing.length === 1 ? 'parcel' : 'parcels'} coming back`
+          + ` (${money(cents(stillComing))})`
+        : '',
+      backWithUs.length
+        ? `${backWithUs.length} ${backWithUs.length === 1 ? 'parcel' : 'parcels'} back with us`
+          + ` (${money(cents(backWithUs))})`
+        : '',
+    ].filter(Boolean).join(' · '),
     doneToday,
     totalToday,
     progressLabel: totalToday ? `${doneToday} of ${totalToday} done today` : 'nothing owed today',

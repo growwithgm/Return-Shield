@@ -78,7 +78,10 @@ function stubTrackpub(answer: (code: string) => LookupResult, delayMs = 0, batch
 
 const emptyAnswer = (): LookupResult => ({
   ok: true,
-  outcome: { events: [], problems: [], errors: [], codesSeen: [] },
+  // `associated` is the return code Correos names on the lookup. Required
+  // rather than optional on purpose: a mock that silently lacks it is a mock
+  // that silently never finds a return. See return-code.ts.
+  outcome: { events: [], associated: [], problems: [], errors: [], codesSeen: [] },
   raw: {},
 });
 
@@ -212,6 +215,7 @@ describe('the reconcile sweep', () => {
       ok: true,
       raw: {},
       outcome: {
+        associated: [],
         problems: [],
         errors: [],
         codesSeen: [f.shippingCode],
@@ -242,6 +246,7 @@ describe('the reconcile sweep', () => {
       ok: true,
       raw: {},
       outcome: {
+        associated: [],
         problems: [],
         errors: [],
         codesSeen: [f.shippingCode],

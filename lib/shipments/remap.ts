@@ -1,6 +1,6 @@
 import { sql as raw } from 'drizzle-orm';
 import { getDb, rowsOf, at as ts } from '@/db';
-import { matchCorreosEvent } from '@/lib/carriers/correos/state-map';
+import { matchCorreosEvent, needsReview } from '@/lib/carriers/correos/state-map';
 import { now } from '@/lib/clock';
 import { say } from '@/lib/activity';
 import { reproject } from './repo';
@@ -110,14 +110,21 @@ export async function remapKnownEvents(): Promise<RemapOutcome> {
     out.events += rows.length;
     for (const r of rows) touched.add(r.shipment_id);
 
-    // Only a code or a wording answers the review queue. A bare phase match is
-    // still a parcel moving on a guess, which is exactly what the queue is
-    // for, so those rows stay open.
-    //
-    // `return-phase` and `return-text` are NOT guesses and do close their row:
-    // phase DEVOLUCION means a return whatever the wording says, and
-    // "pendiente de devolución" says so in words. See state-map.ts.
-    if (match.via !== 'phase') {
+    /*
+     * ONE RULE, IN ONE PLACE. `needsReview` is the definition of "a human
+     * should still look at this", and this is the inverse of it — not a second
+     * opinion about it.
+     *
+     * It used to read `match.via !== 'phase'`, which agreed with `needsReview`
+     * while there were only three kinds of match and stopped agreeing the
+     * moment `return-phase` was added. A DEVOLUCION event whose wording we
+     * recognise ("Dirección incorrecta") has nothing left to teach anybody and
+     * closes its row; one whose wording we have never seen ("Trámite aduanero
+     * de devolución") is exactly what the queue is for, and the old condition
+     * closed it — throwing away the one record of a wording worth collecting.
+     * `needsReview` already draws that line. See state-map.ts.
+     */
+    if (!needsReview(t.event_code, t.event_desc, t.phase, t.long_text)) {
       const resolved = await resolveReview(t.event_code, t.event_desc, match.state);
       if (resolved) out.resolved.push(`${t.event_code} → ${match.state}`);
     }

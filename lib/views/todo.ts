@@ -38,6 +38,7 @@ interface RawTodoRow {
   id: string;
   state: string;
   office_arrived_at: string | null;
+  returned_at: string | null;
   muted_until: string | null;
   dropped_at: string | null;
   restocked_at: string | null;
@@ -54,7 +55,7 @@ interface RawTodoRow {
 
 async function load(): Promise<DecidableShipment[]> {
   const result = await getDb().execute(raw`
-    SELECT s.id, s.state, s.office_arrived_at, s.muted_until, s.dropped_at,
+    SELECT s.id, s.state, s.office_arrived_at, s.returned_at, s.muted_until, s.dropped_at,
            s.restocked_at, s.redirect_pending,
            o.customer_name, o.order_number, o.total_value_cents, o.payment_method, o.city,
            st.platform AS store_platform,
@@ -84,6 +85,14 @@ async function load(): Promise<DecidableShipment[]> {
     state: r.state as ShipmentState,
     officeArrivedAt: r.office_arrived_at ? new Date(r.office_arrived_at) : null,
     officeName: r.office_name,
+    /*
+     * The count does not depend on this — `actionable` only asks whether
+     * `nextAction` returns anything at all, not what it says — but it is
+     * selected rather than hard-coded null so this second loader stays a
+     * faithful `DecidableShipment`. The next thing to read a reason line from
+     * here gets the right text instead of a quiet null.
+     */
+    returnedAt: r.returned_at ? new Date(r.returned_at) : null,
     town: r.city ?? '',
     customerName: customerLabel({
       customerName: r.customer_name,

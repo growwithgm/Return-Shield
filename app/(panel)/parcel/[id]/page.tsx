@@ -6,7 +6,7 @@ import { loadRows } from '@/lib/views/rows';
 import { ladderInput } from '@/lib/shipments/repo';
 import { parcelScans } from '@/lib/views/scans';
 import { upcomingPlan, RUNG_TEXT } from '@/lib/escalation/ladder';
-import { STATE_LABEL } from '@/lib/carriers/correos/state-map';
+import { STATE_LABEL, eventStateLabel } from '@/lib/carriers/correos/state-map';
 import { now } from '@/lib/clock';
 import { exact, human } from '@/lib/time';
 import { HeroNumber, PayBadge, ScanBadge, StateChip, Card, toneColour } from '@/components/ui';
@@ -200,7 +200,16 @@ export default async function ParcelPage({ params }: { params: { id: string } })
               events={events.map((e, i) => ({
                 id: e.id,
                 desc: e.eventDesc,
-                state: e.mappedState ? (STATE_LABEL[e.mappedState] ?? e.mappedState) : null,
+                /*
+                 * READ ON ITS OWN LEG. The return's events are Correos'
+                 * ordinary words — "Devolución admitida", a van, "Entregado"
+                 * — and through the outbound table they read "Pre-admission",
+                 * "Out for delivery" and "Delivered", every one of which is
+                 * a statement about the customer and every one of them false.
+                 * The "Return · DX…" tag beside them is not enough: nobody
+                 * reads a tag and then re-translates the sentence next to it.
+                 */
+                state: eventStateLabel(e.mappedState, e.leg),
                 when: human(e.occurredAt, at),
                 time: exact(e.occurredAt).split(', ')[1] ?? '',
                 exact: exact(e.occurredAt),

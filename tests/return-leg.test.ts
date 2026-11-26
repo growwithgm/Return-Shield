@@ -1,8 +1,13 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { getDb } from '@/db';
 import { shipmentEvents, shipments } from '@/db/schema';
-import { project, type ProjectableEvent } from '@/lib/state-machine/project';
+import { project, returnLegMeans, type ProjectableEvent } from '@/lib/state-machine/project';
+import { SHIPMENT_STATES } from '@/lib/state-machine/states';
+import {
+  STATE_LABEL, eventStateLabel, returnLegStateLabel,
+} from '@/lib/carriers/correos/state-map';
+import { nextAction, type DecidableShipment } from '@/lib/escalation/decide';
 import { ingestEvent } from '@/lib/shipments/ingest';
 import {
   assignReturnCodes, noteAssociatedCodes, plausibleReturnCode, pollReturnLegs,
@@ -44,6 +49,169 @@ beforeEach(async () => {
 afterAll(async () => {
   resetClock();
   await closeDb();
+});
+
+/* ------------------------------------------------ what the screens say about it */
+
+describe('reading a return leg in English', () => {
+  /*
+   * NOTHING HAD EVER REACHED `returned`, so none of these texts had ever been
+   * seen by anybody. The catch-up puts about sixty-nine parcels on Today at
+   * once, which is when every one of them gets read for the first time.
+   */
+  it('reads the return leg as the journey home, not as the customer\u2019s', () => {
+    // The three the operator found, and what they used to read.
+    expect(eventStateLabel('created', 'return')).toBe('Return accepted by Correos');
+    expect(eventStateLabel('created', 'outbound'))
+      .toBe('Pre-admission (label made, not handed to Correos)');
+
+    expect(eventStateLabel('out_for_delivery', 'return')).toBe('On its way back to us');
+    expect(eventStateLabel('out_for_delivery', 'outbound')).toBe('Out for delivery');
+
+    expect(eventStateLabel('delivered', 'return')).toBe('Back with us');
+    expect(eventStateLabel('delivered', 'outbound')).toBe('Delivered');
+  });
+
+  it('has a word for every state a return leg can carry, not only the happy ones', () => {
+    /*
+     * The mapper reads a code, a wording and a phase and never reads a leg, so
+     * a return shipment produces every event an outbound one can — with US as
+     * the addressee. These four are rare and all real.
+     */
+    expect(eventStateLabel('failed', 'return'))
+      .toBe('Correos could not deliver the return to us');
+    expect(eventStateLabel('at_office', 'return')).toBe('Waiting for us at a post office');
+    // `H01R421V` on the return leg is Correos saying the address they are
+    // returning it TO is wrong — ours, the one RETURN_POSTCODE put in the code.
+    expect(eventStateLabel('bad_address', 'return')).toBe('Correos says our returns address is wrong');
+    expect(eventStateLabel('refused', 'return')).toBe('Return refused at our door');
+
+    // And every state says something different about the way back. The table
+    // being total is what lets `eventStateLabel` refuse to guess, below.
+    for (const state of SHIPMENT_STATES) {
+      const back = eventStateLabel(state, 'return');
+      expect(back, state).toBeTruthy();
+      expect(back, state).not.toBe(eventStateLabel(state, 'outbound'));
+    }
+  });
+
+  it('shows a bare state name rather than the outbound word it has no label for', () => {
+    /*
+     * The fall-through this deliberately does NOT have. A return-leg state
+     * the table has no sentence for reads as the raw name — ugly, obvious,
+     * and somebody fixes it. Falling back to `STATE_LABEL` would put "Out for
+     * delivery" on a van at our own door again, silently, on the day somebody
+     * adds a state and forgets a line.
+     */
+    expect(eventStateLabel('something_new', 'return')).toBe('something_new');
+    expect(eventStateLabel('something_new', 'outbound')).toBe('something_new');
+  });
+
+  it('says nothing about an event it has no mapping for', () => {
+    // The caller keeps its own "not seen before" wording rather than being
+    // handed a guess.
+    expect(eventStateLabel(null, 'return')).toBeNull();
+    expect(eventStateLabel(null, 'outbound')).toBeNull();
+    // And an absent leg reads as the outbound one, which is what every event
+    // written before the return leg existed is.
+    expect(eventStateLabel('delivered')).toBe('Delivered');
+  });
+
+  it('reads a DX code typed into the Settings test as the parcel will read', () => {
+    // "Reads as: Delivered" was true of nothing anybody wanted to know: the
+    // box is on our own shelf.
+    expect(returnLegStateLabel('returned')).toBe('Back with us (Returned)');
+    expect(returnLegStateLabel('returning')).toBe('Still on its way back to us (Coming back)');
+    // The parcel's own word in brackets, because that is what every other
+    // screen calls it and nobody should have to guess they are the same thing.
+    expect(returnLegStateLabel('returned')).toContain(STATE_LABEL.returned);
+  });
+
+  it('agrees with the projection about what one return event means', () => {
+    /*
+     * The Settings test and the state a parcel actually ends up in must not
+     * drift, so both read `returnLegMeans`. `collected` counts as back with
+     * us: on this leg the somebody who took it is us.
+     */
+    expect(returnLegMeans('delivered')).toBe('returned');
+    expect(returnLegMeans('collected')).toBe('returned');
+    for (const state of ['created', 'accepted', 'in_transit', 'out_for_delivery', 'failed', 'at_office'] as const) {
+      expect(returnLegMeans(state), state).toBe('returning');
+    }
+    expect(returnLegMeans(null)).toBe('returning');
+  });
+});
+
+describe('the reason line on Today', () => {
+  /** A parcel on the restock pile, with nothing else to say about it. */
+  function back(over: Partial<DecidableShipment>): DecidableShipment {
+    return {
+      id: 'x',
+      state: 'returned',
+      officeArrivedAt: null,
+      officeName: null,
+      returnedAt: null,
+      town: '',
+      customerName: 'Cristina Martínez',
+      valueCents: 3990,
+      paymentMethod: 'cod',
+      dropped: false,
+      restocked: false,
+      redirectPending: false,
+      mutedUntil: null,
+      openTasks: [],
+      lastContactOutcome: null,
+      ...over,
+    };
+  }
+
+  it('says the day a returned parcel landed', () => {
+    const why = nextAction(back({ returnedAt: new Date('2026-11-19T09:37:00Z') }))?.why;
+    expect(why).toBe('Correos delivered it back to us on 19 Nov');
+  });
+
+  it('says only that it is here when no date was recorded', () => {
+    // A `returned` row with no `returnedAt` is one somebody corrected by hand:
+    // `reproject` writes the state and the date in one statement. No invented
+    // date — see DECISIONS.md and tests/no-invented-date.test.ts.
+    expect(nextAction(back({}))?.why).toBe('It is back with us');
+  });
+
+  it("keeps \"Customer didn't want it\" for the one state it is true of", () => {
+    // It used to be the line on EVERY returned parcel, and most of the
+    // eighty-seven came back on a wrong address or an expired window.
+    expect(nextAction(back({ state: 'refused' }))?.why).toBe("Customer didn't want it");
+    expect(nextAction(back({ state: 'returned' }))?.why).not.toContain('want it');
+    expect(nextAction(back({ state: 'returning' }))?.why).not.toContain('want it');
+  });
+
+  it('names the office only when Correos named one', () => {
+    expect(nextAction(back({ state: 'returning', officeName: 'Oficina Madrid Sucursal 12' }))?.why)
+      .toBe('Correos is sending it back from Oficina Madrid Sucursal 12');
+    // The line this replaced fell back to "the post office", which for every
+    // return that started with a wrong address named an office the parcel had
+    // never been to.
+    expect(nextAction(back({ state: 'returning' }))?.why).toBe('Correos is sending it back');
+  });
+
+  it('never claims to know WHY a return started, because the row cannot', () => {
+    /*
+     * The projection overwrites `state` and `state_since` the moment a parcel
+     * moves, so a `returned` parcel no longer remembers it was `bad_address`
+     * or `at_office`, and the sentence Correos sent lives on `shipment_events`
+     * which `nextAction` never sees. A wrong address and an expired collection
+     * window are the same thing from here, and the text must not pick one.
+     */
+    const whys = (['returning', 'returned'] as const).map((state) =>
+      nextAction(back({ state, officeArrivedAt: new Date('2026-11-01T00:00:00Z') }))?.why ?? '');
+
+    for (const why of whys) {
+      expect(why.toLowerCase()).not.toContain('address');
+      expect(why.toLowerCase()).not.toContain('collect');
+      expect(why.toLowerCase()).not.toContain('time ran out');
+      expect(why.toLowerCase()).not.toContain('refus');
+    }
+  });
 });
 
 /* -------------------------------------------------------- the return leg's events */
@@ -410,12 +578,51 @@ describe('following the return to the end', () => {
 
 /* ------------------------------------------------------------------ catch-up */
 
+/**
+ * One of the twenty-nine, AS THE OLD CODE LEFT IT.
+ *
+ * The catch-up exists for rows the OLD mapper wrote, and ingesting the same
+ * payload through the NEW one does not produce them — the new mapper reads
+ * phase DEVOLUCION first, so "Dirección incorrecta" maps to `returning` and
+ * the parcel leaves `bad_address` at ingest. A test that set up its fixture
+ * that way would be testing the catch-up against a database that does not
+ * need catching up, and would pass whatever the catch-up did.
+ *
+ * So the rows are put back the way production holds them today:
+ *
+ *   "Dirección incorrecta"  mapped_state = 'bad_address'   (the wording won)
+ *   "Desestacionado"        mapped_state = null            (nothing matched)
+ *   the parcel              state        = 'bad_address'
+ *
+ * The raw payloads are untouched, which is the whole reason a replay is
+ * possible at all: every byte Correos ever sent is still there, so the fix is
+ * "re-read it", not "go and ask again".
+ */
+async function asTheOldMapperLeftIt(shipmentId: string): Promise<void> {
+  await getDb().update(shipmentEvents)
+    .set({ mappedState: 'bad_address' })
+    .where(and(
+      eq(shipmentEvents.shipmentId, shipmentId),
+      eq(shipmentEvents.eventDesc, 'Dirección incorrecta'),
+    ));
+  await getDb().update(shipmentEvents)
+    .set({ mappedState: null })
+    .where(and(
+      eq(shipmentEvents.shipmentId, shipmentId),
+      eq(shipmentEvents.eventDesc, 'Desestacionado'),
+    ));
+  await getDb().update(shipments)
+    .set({ state: 'bad_address' })
+    .where(eq(shipments.id, shipmentId));
+}
+
 describe('the catch-up', () => {
   it('previews without writing anything, and the apply does what it promised', async () => {
-    await makeShipment({ shippingCode: ORIGINAL, state: 'bad_address' });
+    const parcel = await makeShipment({ shippingCode: ORIGINAL, state: 'bad_address' });
     for (const event of normalisePayload(RETURN_STARTED_RESPONSE, 'poll').events) {
       await ingestEvent(event, { quiet: true });
     }
+    await asTheOldMapperLeftIt(parcel.shipmentId);
 
     const preview = await previewReturnCatchUp();
     expect(preview.comingBack).toBe(1);
@@ -429,8 +636,33 @@ describe('the catch-up', () => {
     const again = await previewReturnCatchUp();
     expect(again).toEqual(preview);
     const [before] = await getDb().select().from(shipments)
-      .where(eq(shipments.shippingCode, ORIGINAL));
+      .where(eq(shipments.id, parcel.shipmentId));
     expect(before.returnCode).toBeNull();
+    expect(before.state).toBe('bad_address');
+
+    /*
+     * And now the half the test's own name promised and did not do: the apply
+     * has to produce the numbers the preview put on the button. A preview that
+     * promises one thing and an apply that does another is the one failure
+     * this two-press shape exists to prevent.
+     */
+    const result = await applyReturnCatchUp();
+
+    expect(result.comingBack).toBe(preview.comingBack);
+    expect(result.leavingWrongAddress).toBe(preview.leavingWrongAddress);
+    expect(result.wouldDerive).toBe(preview.wouldDerive);
+    expect(result.derived).toBe(preview.wouldDerive);
+    // Two events re-read, on the one parcel: the wording and the long text.
+    expect(result.remappedEvents).toBe(2);
+    expect(result.remappedParcels).toBe(1);
+
+    const [after] = await getDb().select().from(shipments)
+      .where(eq(shipments.id, parcel.shipmentId));
+    expect(after.returnCode).toBe(RETURN);
+    expect(after.returnCodeSource).toBe('derived');
+    // Out of the Wrong-address worklist, which is where it should never have
+    // been: Correos had already started the return on 18 November.
+    expect(after.state).toBe('returning');
   });
 
   it('is safe to press twice', async () => {

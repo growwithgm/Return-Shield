@@ -1,4 +1,5 @@
 import type { ShipmentState } from '@/lib/state-machine/states';
+import type { EventLeg } from './return-code';
 
 /**
  * The one place Spanish becomes a state. Nothing else in the codebase is
@@ -305,12 +306,133 @@ export const STATE_LABEL_SHORT: Record<string, string> = {
 };
 
 /**
+ * THE SAME EVENTS, READ AS THE JOURNEY HOME.
+ *
+ * A return travels under a code of Correos' own, and they describe that
+ * journey in exactly the words they use for a journey to a customer — because
+ * to them it IS one, with us as the addressee. So the mapper, which reads an
+ * event and knows nothing about which leg it came from, maps the return's
+ * first event to `created`, the van bringing the box to our door to
+ * `out_for_delivery`, and the handover to `delivered`. Rendered through
+ * `STATE_LABEL` those read:
+ *
+ *   "Devolución admitida"  ->  Pre-admission (label made, not handed to Correos)
+ *   the van to our door    ->  Out for delivery
+ *   "Entregado"            ->  Delivered
+ *
+ * Every one of which is a lie about the customer, sitting on a timeline the
+ * operator reads down to answer "where is this parcel". The "Return · DX…" tag
+ * beside them says which leg they are, and is not enough: nobody reads a tag
+ * and then re-translates the sentence next to it.
+ *
+ * WHAT THE LEG CHANGES IS THE SUBJECT OF THE SENTENCE, not the fact. So this
+ * is a second table rather than a rewording of the first, and it is HERE
+ * because this file is "the one place Spanish becomes a state" — a label
+ * table that lived next to a screen would be a second answer to the same
+ * question, and the Settings Correos test needs the same answer.
+ *
+ * EVERY STATE IS SPELLED OUT, not only the three anybody has reported, and
+ * most of the rest are reachable rather than theoretical. The mapper reads a
+ * code, a wording and a phase; it never reads a leg; so a return shipment can
+ * produce any event an outbound one can, with us as the addressee:
+ *
+ *   `failed`      Correos tried OUR door and nobody was in.
+ *   `at_office`   the return is at a counter waiting for US to collect it.
+ *   `bad_address` `H01R421V` on the return leg, which is Correos saying the
+ *                 address they are returning it TO is wrong — i.e. ours, the
+ *                 one RETURN_POSTCODE put in the code.
+ *   `refused`     somebody at our end turned the return away at the door.
+ *   `returning`   a DEVOLUCION-phase event on the return shipment itself. It
+ *                 says the return is being sent back and NOT where to, so the
+ *                 label says only that.
+ *
+ * Two are genuinely unreachable from any event, on either leg, because no
+ * table maps to them: `returned` (a parcel state the projection decides across
+ * a whole leg, never one event) and `stale` (our own word for silence). They
+ * are here so the table is total over `SHIPMENT_STATES`, which
+ * tests/language.test.ts holds it to.
+ *
+ * `in_transit` and `out_for_delivery` get separate sentences, as they do
+ * outbound: the depot and the van at our door are different news, and the
+ * second is the one the operator can act on.
+ */
+export const RETURN_LEG_LABEL: Record<string, string> = {
+  created: 'Return accepted by Correos',
+  accepted: 'Return accepted by Correos',
+  in_transit: 'In transit back to us',
+  out_for_delivery: 'On its way back to us',
+  failed: 'Correos could not deliver the return to us',
+  at_office: 'Waiting for us at a post office',
+  collected: 'Back with us (collected at a Correos counter)',
+  delivered: 'Back with us',
+  bad_address: 'Correos says our returns address is wrong',
+  refused: 'Return refused at our door',
+  returning: 'The return itself is being sent back',
+  // Not reachable from an event. See the note above.
+  returned: 'Back with us',
+  stale: 'No news from Correos about the return',
+};
+
+/**
+ * One event's English, read on the leg it actually belongs to.
+ *
+ * Null for an event we have no mapping for, so a caller keeps its own "not
+ * seen before" wording rather than being handed a guess.
+ */
+export function eventStateLabel(
+  mappedState: string | null | undefined,
+  leg: EventLeg = 'outbound',
+): string | null {
+  if (!mappedState) return null;
+
+  /*
+   * NO FALLING BACK TO THE OUTBOUND TABLE. A return-leg state this table has
+   * no word for shows the bare state name — ugly, obvious, and somebody fixes
+   * it — because the alternative is the one failure the table exists to
+   * prevent: a van at OUR door quietly reading "Out for delivery" again, on
+   * the day somebody adds a state and forgets a line.
+   *
+   * tests/language.test.ts holds the table total over `SHIPMENT_STATES`, so
+   * this branch is unreachable today. It is written this way for the day it
+   * is not.
+   */
+  if (leg === 'return') return RETURN_LEG_LABEL[mappedState] ?? mappedState;
+
+  return STATE_LABEL[mappedState] ?? mappedState;
+}
+
+/**
+ * What a PARCEL's state reads as to somebody who typed its RETURN code.
+ *
+ * The Settings Correos test's "Reads as" line. Typing
+ * `DXA6TP9800129340128012S` into it and being told "Delivered" is true of
+ * nothing anybody wanted to know: the box is on our own shelf. The parcel's
+ * state in brackets because that is the word every other screen uses for it,
+ * and somebody comparing two screens should not have to guess that "Back with
+ * us" and "Returned" are the same thing.
+ */
+export function returnLegStateLabel(state: string): string {
+  const own: Record<string, string> = {
+    returned: 'Back with us',
+    returning: 'Still on its way back to us',
+  };
+  const plain = STATE_LABEL[state] ?? state;
+  return own[state] ? `${own[state]} (${plain})` : plain;
+}
+
+/**
  * Correos' own word for each state, for the muted second line.
  *
  * Not a translation of the English: it is the phrase Correos themselves use,
  * so it matches what the public tracker and their phone agents say. `stale` is
  * empty because it is not a Correos state at all — it is our own word for
  * silence, and inventing Spanish for it would be putting words in their mouth.
+ *
+ * NO PER-LEG VARIANT, unlike `STATE_LABEL`, and that is not an omission. This
+ * line exists so somebody on the phone to Correos can match what they are
+ * being told, and Correos say "Entregado" for both legs — they do not know
+ * they are the second one. Translating it would be putting our reading in
+ * their mouth, which is the one thing this table must never do.
  */
 export const STATE_ES: Record<string, string> = {
   created: 'Pre-admisión / Prerregistrado',

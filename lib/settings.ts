@@ -1,7 +1,7 @@
 import { eq } from 'drizzle-orm';
 import { getDb, withDbRetry } from '@/db';
 import { settings } from '@/db/schema';
-import type { ReturnLegProbe } from '@/lib/shipments/return-leg';
+import type { ReturnLegProbe } from '@/lib/shipments/return-probe';
 
 /**
  * The handful of numbers that change how the system behaves, kept in the

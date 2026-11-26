@@ -4,7 +4,7 @@ import { eventReviewQueue, postcodeStats, stores } from '@/db/schema';
 import { ShopifyPull } from '@/components/ShopifyPull';
 import { TikTokHandover } from '@/components/TikTokHandover';
 import { ReturnCatchUp } from '@/components/ReturnCatchUp';
-import { describeProbe } from '@/lib/shipments/return-leg';
+import { describeProbe } from '@/lib/shipments/return-probe';
 import { IntegrationsPanel } from '@/components/IntegrationsPanel';
 import { SweepPanel } from '@/components/SweepPanel';
 import { JobRunsPanel } from '@/components/JobRunsPanel';

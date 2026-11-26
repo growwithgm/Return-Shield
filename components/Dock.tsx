@@ -1,7 +1,7 @@
 import { desc, eq } from 'drizzle-orm';
 import { getDb } from '@/db';
 import { notifications, orders, shipmentEvents, shipments, stores } from '@/db/schema';
-import { STATE_LABEL } from '@/lib/carriers/correos/state-map';
+import { eventStateLabel } from '@/lib/carriers/correos/state-map';
 import { fmt, exact } from '@/lib/time';
 import { DockTabs } from './DockTabs';
 
@@ -36,6 +36,19 @@ export async function Dock() {
       id: shipmentEvents.id,
       desc: shipmentEvents.eventDesc,
       mappedState: shipmentEvents.mappedState,
+      /*
+       * Which journey the event belongs to.
+       *
+       * THIS PANEL IS NOT RENDERED TODAY — the layout dropped it so the
+       * eight-column Parcels table could have the width, and
+       * tests/language.test.ts pins both that it is unimported and that the
+       * files stay on disk, because WhatsApp is coming back. It is corrected
+       * anyway: it is the only other place in the app that turns a stored
+       * event into English, and re-importing it with the outbound table would
+       * put "Delivered" on a parcel sitting on our own shelf. Fixing it now
+       * costs one column; finding it later costs somebody's afternoon.
+       */
+      leg: shipmentEvents.leg,
       occurredAt: shipmentEvents.occurredAt,
       source: shipmentEvents.source,
       customerName: orders.customerName,
@@ -65,7 +78,7 @@ export async function Dock() {
         id: e.id,
         shipmentId: e.shipmentId,
         desc: e.desc,
-        state: e.mappedState ? (STATE_LABEL[e.mappedState] ?? e.mappedState) : 'Not seen before',
+        state: eventStateLabel(e.mappedState, e.leg) ?? 'Not seen before',
         known: e.mappedState !== null,
         source: e.source === 'poll' ? 'We asked Correos' : 'Live from Correos',
         when: `${fmt(e.occurredAt).date} ${fmt(e.occurredAt).time}`,

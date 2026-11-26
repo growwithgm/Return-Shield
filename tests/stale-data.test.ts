@@ -147,6 +147,7 @@ describe('a real sweep records what it stored', () => {
       ok: true,
       raw: {},
       outcome: {
+        associated: [],
         problems: [],
         errors: [],
         codesSeen: [code],

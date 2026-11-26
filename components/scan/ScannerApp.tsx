@@ -63,7 +63,20 @@ const RETRY_MS = 3_000;
  */
 type Flash = { kind: 'saved' | 'duplicate' | 'wrong-way'; base: string; at: number };
 
-/** The open question: this pile may be going the other way. */
+/**
+ * The open question: this pile may be going the other way.
+ *
+ * `kind` is `DirectionVerdict.doubt` under another name, and the rename is why
+ * this is built field by field below rather than with a spread. A
+ * `{ ...verdict, code, run }` typechecked — every field it needed was
+ * somewhere in the object — and produced a banner whose `kind` was
+ * `undefined`, so EVERY warning fell through to "Is this pile going the other
+ * way?", including a DX label in an Outgoing batch, which is the one case the
+ * phone can be certain about and the one that most needed its own words.
+ *
+ * Two types that differ by one field name must never be spread into each
+ * other. `doubtVerdict` below is the only place the two meet.
+ */
 type Doubt = {
   kind: DirectionDoubt;
   message: string;
@@ -73,6 +86,14 @@ type Doubt = {
   /** How many in a row have looked like this. See DOUBT_RUN. */
   run: number;
 };
+
+/**
+ * One verdict, as the banner needs it. Written out field by field on purpose —
+ * see `Doubt`.
+ */
+function doubtVerdict(v: DirectionVerdict, code: string, run: number): Doubt {
+  return { kind: v.doubt, message: v.message, shouldBe: v.shouldBe, code, run };
+}
 
 export function ScannerApp({
   direction,
@@ -232,7 +253,7 @@ export function ScannerApp({
         if (body.doubt) {
           doubtRun.current += 1;
           const run = doubtRun.current;
-          setDoubt({ ...body.doubt, code: body.item.codeAsRead, run });
+          setDoubt(doubtVerdict(body.doubt, body.item.codeAsRead, run));
           if (run === 1) beepWrongWay();
         } else {
           // A read the server was happy with breaks the run: three in a row is
@@ -297,7 +318,7 @@ export function ScannerApp({
       beepWrongWay();
       setFlash({ kind: 'wrong-way', base: code.base, at: Date.now() });
       doubtRun.current += 1;
-      setDoubt({ ...instant, code: code.raw, run: doubtRun.current });
+      setDoubt(doubtVerdict(instant, code.raw, doubtRun.current));
     } else if (already) {
       beepDuplicate();
       setFlash({ kind: 'duplicate', base: code.base, at: Date.now() });

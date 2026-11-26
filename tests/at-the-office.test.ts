@@ -199,6 +199,7 @@ describe('the ordering reads off days at the office', () => {
     state: 'at_office',
     officeArrivedAt: null,
     officeName: 'Oficina Madrid Sucursal 12',
+    returnedAt: null,
     town: 'Getafe, Madrid',
     customerName: 'Lucía Fernández Ortiz',
     valueCents: 6490,

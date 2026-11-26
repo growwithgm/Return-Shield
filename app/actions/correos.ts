@@ -4,10 +4,14 @@ import { requireUser } from '@/lib/auth/guard';
 import { correosToken } from '@/lib/carriers/correos/token';
 import { TrackpubClient } from '@/lib/carriers/correos/trackpub';
 import { getSetting, setSetting } from '@/lib/settings';
-import { STATE_LABEL, matchCorreosEvent } from '@/lib/carriers/correos/state-map';
+import {
+  STATE_LABEL, eventStateLabel, matchCorreosEvent, returnLegStateLabel,
+} from '@/lib/carriers/correos/state-map';
+import { returnLegReads } from '@/lib/state-machine/project';
 import { associatedCodesOf } from '@/lib/carriers/correos/normalise';
 import {
   RETURN_PREFIX, hasValidCheckLetter, isReturnCode, returnCodeFor, returnPostcode,
+  type EventLeg,
 } from '@/lib/carriers/correos/return-code';
 import { exact } from '@/lib/time';
 import { getDb, rowsOf } from '@/db';
@@ -185,11 +189,47 @@ export async function testCorreosConnection(shippingCode: string): Promise<Corre
   const events = result.outcome.events;
   // Newest first, the way the parcel page shows them.
   const ordered = [...events].sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime());
+  /*
+   * Mapped once. Three readings come out of this list — the "Reads as" line,
+   * every row of the timeline, and what the leg says as a whole — and they
+   * have to be the same reading. The newest event was being mapped twice over,
+   * here and again inside the timeline, which is one place too many for them
+   * to agree.
+   */
+  const matched = ordered.map((e) => matchCorreosEvent(e.eventCode, e.eventDesc, e.phase, e.longText));
   const newest = ordered[0];
-  const match = newest
-    ? matchCorreosEvent(newest.eventCode, newest.eventDesc, newest.phase, newest.longText)
-    : null;
+  const match = matched[0] ?? null;
   const mapped = match?.state ?? null;
+
+  /*
+   * WHICH LEG THE CODE TYPED INTO THE BOX IS.
+   *
+   * Every event of a `DX` code is a return-leg event, and the mapper does not
+   * know that — it reads a sentence, not a leg. So "Entregado" on a return
+   * mapped to `delivered` and the screen said "Reads as: Delivered" about a
+   * parcel sitting on our own shelf: true of nothing anybody wanted to know,
+   * and the same wrong reading the timeline had.
+   *
+   * `returnLegMeans` is the projection's own rule, imported rather than
+   * repeated, so this screen and the state a parcel actually ends up in cannot
+   * drift apart.
+   */
+  const leg: EventLeg = isReturnCode(code) ? 'return' : 'outbound';
+
+  /*
+   * ON THE WAY BACK, THE WHOLE LEG ANSWERS — NOT ITS NEWEST EVENT.
+   *
+   * `returnLegReads` is the projection's own rule over the whole list, and
+   * reading one event instead would disagree with the parcel in both the ways
+   * it can: a handover followed by a later scan (the leg finished; the newest
+   * event does not say so), and a newest event nobody has mapped (the leg has
+   * started; the newest event says nothing at all, so the line would simply
+   * vanish). The return leg's own wordings are the unmapped ones, so the
+   * second case is the common one.
+   */
+  const readsAsState = leg === 'return'
+    ? returnLegReads(matched.map((m) => m?.state ?? null))
+    : mapped;
 
   return {
     token: tokenCheck,
@@ -198,17 +238,18 @@ export async function testCorreosConnection(shippingCode: string): Promise<Corre
       ok: true,
       code,
       events: events.length,
-      timeline: ordered.slice(0, TIMELINE_LIMIT).map((e) => {
-        const m = matchCorreosEvent(e.eventCode, e.eventDesc, e.phase, e.longText);
-        return {
-          when: exact(e.occurredAt),
-          desc: e.eventDesc,
-          code: e.eventCode,
-          phase: e.phase ?? null,
-          state: m ? (STATE_LABEL[m.state] ?? m.state) : null,
-        };
-      }),
-      state: mapped ? (STATE_LABEL[mapped] ?? mapped) : undefined,
+      timeline: ordered.slice(0, TIMELINE_LIMIT).map((e, i) => ({
+        when: exact(e.occurredAt),
+        desc: e.eventDesc,
+        code: e.eventCode,
+        phase: e.phase ?? null,
+        // Per event, on the same leg, from the same mapping as the line above
+        // — the operator noticed the summary, and every row had it too.
+        state: eventStateLabel(matched[i]?.state, leg),
+      })),
+      state: readsAsState
+        ? (leg === 'return' ? returnLegStateLabel(readsAsState) : (STATE_LABEL[readsAsState] ?? readsAsState))
+        : undefined,
       // The newest event in Correos' own words, with its date and time, so the
       // operator can check it against what Mi Oficina shows them.
       latestEvent: newest

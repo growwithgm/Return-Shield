@@ -4,7 +4,7 @@ import { getDb } from '@/db';
 import { shipmentEvents } from '@/db/schema';
 import { TestClock, resetClock } from '@/lib/clock';
 import {
-  STATE_LABEL, STATE_ES, STATE_LABEL_SHORT, stateLabels, eventLabels, mapCorreosEvent,
+  RETURN_LEG_LABEL, STATE_LABEL, STATE_ES, STATE_LABEL_SHORT, stateLabels, eventLabels, mapCorreosEvent,
 } from '@/lib/carriers/correos/state-map';
 import { SHIPMENT_STATES } from '@/lib/state-machine/states';
 import { PARCEL_TABS } from '@/lib/views/parcels';
@@ -57,6 +57,16 @@ describe('status labels', () => {
     for (const state of SHIPMENT_STATES) {
       expect(STATE_LABEL[state], state).toBeTruthy();
       expect(STATE_LABEL_SHORT[state], state).toBeTruthy();
+      /*
+       * And a word for the same state read on the JOURNEY HOME. The mapper
+       * never reads a leg, so a return shipment can produce any event an
+       * outbound one can, with us as the addressee — and the table is total
+       * so `eventStateLabel` never has to guess. The day somebody adds a
+       * state and forgets a line, this is what says so; without it the
+       * operator's timeline would quietly read "Out for delivery" about a van
+       * at our own door. See lib/carriers/correos/state-map.ts.
+       */
+      expect(RETURN_LEG_LABEL[state], state).toBeTruthy();
     }
   });
 
@@ -65,8 +75,28 @@ describe('status labels', () => {
       for (const word of SPANISH_WORDS) {
         expect(STATE_LABEL[state].toLowerCase(), state).not.toContain(word.toLowerCase());
         expect(STATE_LABEL_SHORT[state].toLowerCase(), state).not.toContain(word.toLowerCase());
+        expect(RETURN_LEG_LABEL[state].toLowerCase(), state).not.toContain(word.toLowerCase());
       }
     }
+  });
+
+  it('says something different about the way back, state by state', () => {
+    /*
+     * The point of a second table. `stale` is the one state the leg genuinely
+     * changes nothing about — silence is silence — and it still gets its own
+     * sentence because the operator wants to know WHICH journey went quiet.
+     */
+    for (const state of SHIPMENT_STATES) {
+      expect(RETURN_LEG_LABEL[state], state).not.toBe(STATE_LABEL[state]);
+    }
+
+    // The three the operator asked for, verbatim.
+    expect(RETURN_LEG_LABEL.created).toBe('Return accepted by Correos');
+    expect(RETURN_LEG_LABEL.out_for_delivery).toBe('On its way back to us');
+    expect(RETURN_LEG_LABEL.delivered).toBe('Back with us');
+
+    // The depot and the van are different news on both legs.
+    expect(RETURN_LEG_LABEL.in_transit).not.toBe(RETURN_LEG_LABEL.out_for_delivery);
   });
 
   it('carries Correos\' own word for every state they have one for', () => {

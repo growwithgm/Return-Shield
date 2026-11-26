@@ -70,7 +70,12 @@ async function parcel(code: string, state: string, hours: number | null): Promis
 function stub() {
   const asked: string[] = [];
   const empty = (): LookupResult => ({
-    ok: true, outcome: { events: [], problems: [], errors: [], codesSeen: [] }, raw: {},
+    ok: true,
+    // `associated` is the return code Correos names on the lookup. Required
+    // rather than optional on purpose: a mock that silently lacks it is a
+    // mock that silently never finds a return. See return-code.ts.
+    outcome: { events: [], associated: [], problems: [], errors: [], codesSeen: [] },
+    raw: {},
   });
   setTrackpub({
     configured: true,
@@ -295,7 +300,7 @@ describe('what the run records', () => {
             ok: true,
             raw: {},
             outcome: {
-              problems: [], errors: [], codesSeen: [code],
+              associated: [], problems: [], errors: [], codesSeen: [code],
               events: [
                 {
                   shippingCode: code, eventCode: 'A090000V', eventDesc: 'Prerregistrado',

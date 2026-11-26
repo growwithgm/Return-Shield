@@ -4,10 +4,8 @@ import { say } from '@/lib/activity';
 import { returnCodeFor, returnPostcode } from '@/lib/carriers/correos/return-code';
 import { trackpub } from '@/lib/carriers/correos/trackpub';
 import { getSetting, setSetting } from '@/lib/settings';
-import {
-  assignReturnCodes, pollReturnLegs, returnSignalSql,
-  type ReturnLegProbe,
-} from './return-leg';
+import { assignReturnCodes, pollReturnLegs, returnSignalSql } from './return-leg';
+import type { ReturnLegProbe } from './return-probe';
 import { remapKnownEvents } from './remap';
 
 /**

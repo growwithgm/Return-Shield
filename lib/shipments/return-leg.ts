@@ -7,6 +7,16 @@ import {
 } from '@/lib/carriers/correos/return-code';
 import type { AssociatedShipments } from '@/lib/carriers/correos/normalise';
 import type { LookupResult } from '@/lib/carriers/correos/trackpub';
+import { NO_PROBE_YET, type ReturnLegProbe } from './return-probe';
+
+/*
+ * Re-exported so nothing that imports them from here had to change — and so
+ * there is still one obvious place to look for them. A type-only re-export
+ * where it can be: `export type { … }` is erased, so it adds nothing to any
+ * bundle. See ./return-probe.ts for why they are not declared here.
+ */
+export { NO_PROBE_YET, describeProbe } from './return-probe';
+export type { ReturnLegProbe } from './return-probe';
 
 /**
  * The return leg: finding the code a parcel comes back under, and keeping it.
@@ -342,58 +352,14 @@ export async function returnLegQueue(limit: number): Promise<ReturnLegRow[]> {
   }));
 }
 
-/**
- * What a run of return-leg lookups learnt — including, and especially, whether
- * Correos will answer about a `DX` code at all.
- *
- * NOBODY KNOWS THAT YET. The codes were read off Correos' public tracker,
- * which is a different service from the trackpub `/search` endpoint this system
- * uses, and no DX code has ever been put to trackpub with these credentials.
- * It may answer, it may 404 every one of them, or it may refuse the format. So
- * this is recorded on every run and shown in Settings in those words, rather
- * than being assumed either way. See `app/(panel)/settings`.
+/*
+ * The probe — `ReturnLegProbe`, `NO_PROBE_YET` and `describeProbe` — lives in
+ * ./return-probe.ts and is re-exported above, because the Settings catch-up
+ * card is a CLIENT component and has to read it. One value import of
+ * `describeProbe` from this file pulled the database pool and the mailer into
+ * the browser bundle and stopped `next build`; see that file's header for the
+ * error, and tests/client-bundle.test.ts for what refuses it now.
  */
-export interface ReturnLegProbe {
-  /** ISO. */
-  at: string;
-  /** Return codes we put to Correos. */
-  asked: number;
-  /** How many came back with events. */
-  answered: number;
-  /** How many Correos gave a final "never heard of it" for. */
-  unknown: number;
-  /** How many failed some other way — auth, format, outage. */
-  failed: number;
-  /** The first such failure, verbatim. Empty when there were none. */
-  firstError: string;
-  /** Events stored off the return legs. */
-  newEvents: number;
-  /** Parcels that are back with us, of the ones this run asked about. */
-  arrived: number;
-}
-
-export const NO_PROBE_YET: ReturnLegProbe = {
-  at: '', asked: 0, answered: 0, unknown: 0, failed: 0, firstError: '', newEvents: 0, arrived: 0,
-};
-
-/**
- * Plain English for the Settings screen. The point is that "Correos answered
- * none of them" and "we have not tried" must never read the same.
- */
-export function describeProbe(p: ReturnLegProbe | null): string {
-  if (!p || !p.at) return 'Not tried yet — no return code has been put to Correos.';
-  if (p.asked === 0) return 'Nothing to ask about: no parcel is waiting on a return leg.';
-  if (p.failed > 0 && p.answered === 0) {
-    return `Correos refused all ${p.asked}: ${p.firstError}`;
-  }
-  if (p.answered === 0) {
-    return `Correos has never heard of any of the ${p.asked} return codes we asked about.`
-      + ' Either they do not serve return codes on this endpoint, or the codes are wrong.';
-  }
-  return `Correos answered ${p.answered} of ${p.asked} return codes`
-    + `${p.unknown ? `, had never heard of ${p.unknown}` : ''}`
-    + `${p.failed ? `, refused ${p.failed} (${p.firstError})` : ''}.`;
-}
 
 /**
  * Stamp a return leg as asked-about, so the queue's ordering stays fair.

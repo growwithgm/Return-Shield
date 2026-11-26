@@ -1788,6 +1788,117 @@ that disagrees with the list under it is worse than a slower badge, so the
 count runs the view's own CTE and the sections sum to it by construction. The
 cost is a pair of index lookups per incoming scan in the ninety-day window.
 
+### A client component may not value-import a server module, and a test says so
+
+The return-leg commit typechecked and could not build. `components/ReturnCatchUp.tsx` is
+`'use client'` and had one line — `import { describeProbe } from '@/lib/shipments/return-leg'` — a
+VALUE import, so webpack followed it into the database pool and stopped:
+
+```
+UnhandledSchemeError: Reading from "node:async_hooks" is not handled by plugins
+Import trace: ./db/index.ts -> ./lib/shipments/return-leg.ts -> ./components/ReturnCatchUp.tsx
+```
+
+and again for `node:child_process`, through nodemailer, reached via `lib/alerts`. `npm run
+typecheck` passed — the import is perfectly well typed, and only the bundler knows it cannot be
+followed — so nothing in a 1,180-test suite could have caught it, and it would have failed on
+Vercel.
+
+The fix is the shape to copy: the three pure things the component needed moved into
+`lib/shipments/return-probe.ts`, a module with NO imports at all, re-exported from `return-leg.ts`
+so nothing else had to change. `tests/client-bundle.test.ts` now reads every `'use client'` file
+and refuses the mistake.
+
+Two things make that rule right rather than nearly right. **It stops at a `'use server'`
+boundary** — Next compiles such a module to an RPC reference and its body never crosses, and every
+one of the thirty-nine client components in this app calls a server action whose action reaches the
+database, so a walk that did not stop there would flag all of them and say nothing. **It follows
+the import graph rather than checking a list of module names**: a denylist of "@/db,
+lib/shipments/*, lib/alerts, …" would have caught this one and not the next server module somebody
+writes. What is banned is what actually breaks the build — a `node:` builtin, and the four packages
+that only run on a server. `drizzle-orm/pg-core` is deliberately NOT banned: pulling the schema
+into a bundle is a waste rather than a failure, and the day somebody has a real reason to share a
+type from it, this test should not be the thing in the way.
+
+The test drives itself over the exact import that broke the build and asserts it is refused, so it
+cannot rot into a rule that matches nothing.
+
+### Two types that differ by one field name must never be spread into each other
+
+`DirectionVerdict` is `{ doubt, message, shouldBe }` and the Scanner's local `Doubt` is
+`{ kind, message, shouldBe, code, run }`. `setDoubt({ ...verdict, code, run })` typechecked, because
+every field it needed was *somewhere* in the object, and produced a banner whose `kind` was
+`undefined` — so every wrong-direction warning fell through to "Is this pile going the other way?",
+including a `DX` label in an Outgoing batch, which is the one case the phone can be certain about
+and the one that most needed its own words. A `doubtVerdict()` function is now the only place the
+two types meet, and it writes out every field.
+
+### The return leg gets its own labels, because the leg changes the subject of the sentence
+
+Correos' return shipment is, to them, an ordinary delivery with us as the addressee, and
+`matchCorreosEvent` reads a code, a wording and a phase and never reads a leg. So the return's own
+feed yields the ordinary states, and through `STATE_LABEL` they read:
+
+```
+"Devolución admitida"        ->  Pre-admission (label made, not handed to Correos)
+the van to OUR door          ->  Out for delivery
+"Entregado"                  ->  Delivered
+```
+
+Four statements about the customer, every one false, on the timeline the operator reads down to
+answer "where is this parcel". `project()` already refuses to let the leg drive the state machine
+for exactly this reason; the timeline was still printing the sentences. The "Return · DX…" tag
+beside them is not enough — nobody reads a tag and then re-translates the sentence next to it.
+
+So `RETURN_LEG_LABEL` is a second table in `state-map.ts`, which owns "the one place Spanish becomes
+a state" and now owns the words as well. Three decisions inside it:
+
+**It is total over `SHIPMENT_STATES`, and `eventStateLabel` does not fall back to the outbound
+table.** A state with no return sentence shows the bare state name — ugly, obvious, somebody fixes
+it — because the alternative is a van at our own door quietly reading "Out for delivery" again on
+the day somebody adds a state and forgets a line. `tests/language.test.ts` holds the table total,
+so that branch is unreachable today; it is written for the day it is not.
+
+**Most of the states are reachable, not theoretical.** A return can fail at our door (`failed`), sit
+at a counter waiting for us (`at_office`), be held because the address it is being returned TO is
+wrong (`bad_address` — ours, the one `RETURN_POSTCODE` put in the code), be turned away by somebody
+at our end (`refused`), or carry a DEVOLUCION-phase event on the return shipment itself
+(`returning`, which says the return is being sent back and not where to, so the label says only
+that). Only `returned` and `stale` are unreachable from any event on either leg.
+
+**`STATE_ES` gets no per-leg variant.** That line exists so somebody on the phone to Correos can
+match what they are being told, and Correos say "Entregado" for both legs — they do not know they
+are the second one. Translating it would be putting our reading in their mouth.
+
+### The Today screen says what it knows about a returned parcel, and no more
+
+Nothing had ever reached `returned`, so none of its texts had been read by anybody. Three were
+wrong the moment the catch-up put sixty-nine parcels on the screen at once.
+
+**"Customer didn't want it" was the reason line on all of them.** `nextAction`'s `why` split
+`RETURN_STATES` two ways — `returning` got one sentence, everything else got that one — and
+"everything else" is `refused` *and* `returned`. Most of the eighty-seven came back on "Dirección
+incorrecta" or because nobody collected them; nobody said no at the door. It is now three texts,
+and the one it keeps is for `refused` alone.
+
+**It does not say WHY a return started, because the row cannot.** The projection overwrites `state`
+and `state_since` the moment a parcel moves, so a `returned` parcel no longer remembers it was
+`bad_address` or `at_office`, and the sentence Correos sent lives on `shipment_events`, which
+`nextAction` never sees. A wrong address and an expired collection window are the same thing from
+there. `ingest.ts`'s `whyBack` can name a reason only because the transition hands it the state the
+parcel came from; nothing hands one to a view. So the line says the day it landed and stops — and a
+`returned` row with no `returnedAt` says only "It is back with us" rather than inventing a date.
+The old line's `?? 'the post office'` is gone for the same reason: for every return that started
+with a wrong address it named an office the parcel had never been to.
+
+**"1 parcels coming back" was two faults in one sentence.** The plural was the only unguarded one
+left in `todayView`, and "coming back" is false for a parcel on a shelf in the building. The digest
+is two lines now, one per group, because each entry on that screen is one short sentence about one
+kind of work and the two groups are a different job on a different day; the banner is one line with
+two clauses, because that strip has one button over the whole pile. The pile itself stays one array
+— the job is the same for both halves — and `restockLine` is decided in `rows.ts` rather than summed
+in JSX, which is what that file's own contract says.
+
 ### `shipment_events_dedupe_idx` was left leg-blind
 
 The dedupe index is `(shipment_id, event_code, occurred_at)` and knows nothing
