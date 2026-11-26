@@ -10,6 +10,7 @@ import { setSetting } from '@/lib/settings';
 import { setMessageProvider, messageProvider } from '@/lib/messaging';
 import { integrationStatus } from '@/lib/integrations';
 import { nextAction, type DecidableShipment } from '@/lib/escalation/decide';
+import { restockTexts } from '@/lib/views/rows';
 import { resetDb, closeDb } from './helpers/db';
 import { makeShipment } from './helpers/fixtures';
 
@@ -345,5 +346,100 @@ describe('the Correos buttons that only record', () => {
     const panel = codeOf('components/DangerActions.tsx');
     expect(panel).not.toContain('Send to a new address');
     expect(panel).not.toContain('Correos charges');
+  });
+});
+
+/**
+ * What Today says about the pile coming back.
+ *
+ * TWO HALVES, AND THE SCREEN HAS TO MEAN THE ONE IT NAMES. Some of these
+ * parcels are on a shelf in the building and some are still with Correos.
+ * The job is the same for both — log the stock back in — and only one of them
+ * can be done this morning, so every sentence that mentions "already here" or
+ * "when they land" is a claim about a half that may hold nobody.
+ *
+ * It held nobody most days. The banner draws whenever the whole pile is more
+ * than one parcel, and the sub-line was written out in the page: "The ones
+ * already here can be done now", printed whether or not any were. The morning
+ * the operator clears the sixty-nine the catch-up is about, the "here" half
+ * empties and stays empty until the next return arrives — so from then on the
+ * screen sent them to fetch boxes from a shelf that holds none. That is the
+ * steady state, not an edge case.
+ *
+ * Driven straight, without a database: all of this is strings and plurals,
+ * and "1 parcels coming back" is what the operator actually reported.
+ */
+describe('the pile coming back, as Today says it', () => {
+  const pile = (n: number, cents: number) =>
+    Array.from({ length: n }, () => ({ valueCents: cents }));
+
+  /** Every sentence `restockTexts` can produce, for one shape of the pile. */
+  const said = (still: number, here: number): string => {
+    const r = restockTexts(pile(still, 6490), pile(here, 6490));
+    return [...r.digest, r.line, r.note].join(' | ');
+  };
+
+  it('never says a parcel is already here when none is', () => {
+    // The steady state: everything that has landed has been put away.
+    expect(said(18, 0)).not.toMatch(/already here|here now/);
+    expect(said(1, 0)).not.toMatch(/already here|here now/);
+  });
+
+  it('never says one is still on its way when none is', () => {
+    expect(said(0, 69)).not.toMatch(/when they land|when it lands|as they land/);
+    expect(said(0, 1)).not.toMatch(/when they land|when it lands|as they land/);
+  });
+
+  it('says both only when both halves hold something', () => {
+    const both = restockTexts(pile(18, 4000), pile(69, 6490));
+    expect(both.digest).toHaveLength(2);
+    expect(both.line).toBe('18 parcels coming back (€720.00) · 69 parcels back with us (€4478.10)');
+    expect(both.note).toContain('The ones already here can be done now');
+  });
+
+  it('counts the money of each half over that half only', () => {
+    const r = restockTexts(pile(2, 1000), pile(3, 2000));
+    expect(r.line).toBe('2 parcels coming back (€20.00) · 3 parcels back with us (€60.00)');
+    // Not €80.00 twice, and not one total over both: the two answer different
+    // questions — what can be put away now, and what is still out there.
+    expect(r.line).not.toContain('€80.00');
+  });
+
+  it('says "1 parcel", not "1 parcels"', () => {
+    // The operator's own words: "1 parcels coming back — €64.90".
+    for (const shape of [said(1, 0), said(0, 1), said(1, 1)]) {
+      expect(shape).not.toMatch(/\b1 parcels\b/);
+      expect(shape).not.toMatch(/\b1 (parcel|parcels) .*\bthey land\b/);
+    }
+    expect(said(2, 0)).toContain('2 parcels');
+    expect(said(2, 0)).not.toMatch(/\bit lands\b/);
+  });
+
+  it('says the returned ones are back with us, not coming back', () => {
+    // "Coming back" is what sent them to wait for a parcel they could fetch.
+    const r = restockTexts([], pile(69, 6490));
+    expect(r.digest.join(' ')).toContain('69 parcels back with us');
+    expect(r.digest.join(' ')).not.toContain('coming back');
+    expect(r.line).not.toContain('coming back');
+  });
+
+  it('says nothing at all about an empty pile', () => {
+    expect(restockTexts([], [])).toEqual({ digest: [], line: '', note: '' });
+  });
+
+  it('is the only place those sentences are written', () => {
+    /*
+     * The page renders decided strings. It used to filter and sum cents in
+     * JSX, and then — once that moved here — still carried the sub-line as
+     * literal text, which is how the two came to disagree.
+     */
+    const page = readFileSync('app/(panel)/today/page.tsx', 'utf8');
+    expect(page).toContain('{view.restockLine}');
+    expect(page).toContain('{view.restockNote}');
+    for (const claim of ['already here', 'back with us', 'coming back', 'to put back in stock']) {
+      // Only inside the comment that explains why they are not here.
+      const code = page.split('\n').filter((l) => !l.trim().startsWith('*')).join('\n');
+      expect(code).not.toContain(claim);
+    }
   });
 });

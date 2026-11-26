@@ -66,13 +66,18 @@ export default async function TodayPage({
                 * groups now — some of these parcels are on a shelf in the
                 * building and some are still with Correos — and which is
                 * which is lib/views/rows.ts's job, not this file's.
+                *
+                * BOTH lines, for the same reason. The sentence below this one
+                * used to be written out here, and it said "The ones already
+                * here can be done now" whether or not any of them were: the
+                * morning the operator clears the sixty-nine that have landed,
+                * that half empties and stays empty.
                 */}
               <div className="text-[14.5px] font-semibold text-ink">
                 {view.restockLine}
               </div>
               <div className="mt-[3px] text-[12.5px] text-muted">
-                Same job for all of them: log them back into stock. The ones already
-                here can be done now.
+                {view.restockNote}
               </div>
             </div>
             <Link

@@ -294,10 +294,80 @@ export interface TodayView {
    * cents in JSX against this file's own contract above.
    */
   restockLine: string;
+  /**
+   * The sentence under it. Separate from `restockLine` because it is the one
+   * the page used to hard-code, and hard-coding it was the same mistake
+   * `restockLine` had just been built to stop making.
+   */
+  restockNote: string;
   doneToday: number;
   totalToday: number;
   progressLabel: string;
   callCount: number;
+}
+
+/**
+ * Every sentence the Today screen says about the pile coming back.
+ *
+ * All four in one place — the two digest lines, the heading over "Mark as
+ * back in stock" and the sentence under it — because they describe the same
+ * two halves and the screen showed what happens when they do not agree: the
+ * heading said "18 parcels coming back (€720.00)" and the line under it said
+ * "The ones already here can be done now" over a half holding nobody. That is
+ * the steady state, not an edge case: the morning the operator presses the
+ * button on the sixty-nine that have landed, `backWithUs` empties and stays
+ * empty until the next return arrives, and from then on the screen sent them
+ * to look for boxes on a shelf that holds none.
+ *
+ * Pure on purpose, and it takes the two halves rather than the rows: the
+ * whole of this is strings and plurals, which is the part that was wrong
+ * ("1 parcels coming back"), and it can be driven straight from a test
+ * without a database.
+ */
+export function restockTexts(
+  stillComing: readonly { valueCents: number }[],
+  backWithUs: readonly { valueCents: number }[],
+): { digest: string[]; line: string; note: string } {
+  const sum = (rows: readonly { valueCents: number }[]) =>
+    rows.reduce((a, s) => a + s.valueCents, 0);
+  const parcels = (n: number) => `${n} ${n === 1 ? 'parcel' : 'parcels'}`;
+  const still = stillComing.length;
+  const here = backWithUs.length;
+
+  const digest: string[] = [];
+  if (still) {
+    digest.push(`${parcels(still)} coming back — ${money(sum(stillComing))}`
+      + ` to put back in stock when ${still === 1 ? 'it lands' : 'they land'}.`);
+  }
+  if (here) {
+    digest.push(`${parcels(here)} back with us — ${money(sum(backWithUs))}`
+      + ' to put back in stock now.');
+  }
+
+  const line = [
+    still ? `${parcels(still)} coming back (${money(sum(stillComing))})` : '',
+    here ? `${parcels(here)} back with us (${money(sum(backWithUs))})` : '',
+  ].filter(Boolean).join(' · ');
+
+  /*
+   * The job is the same for both halves — log the stock back in — and the
+   * only question is which of them can be done this morning. So the note
+   * names a half only when that half holds something.
+   */
+  let note = '';
+  if (still && here) {
+    note = 'Same job for all of them: log them back into stock. The ones already here can be done now.';
+  } else if (here) {
+    note = here === 1
+      ? 'Log it back into stock: it is here now.'
+      : 'Same job for all of them: log them back into stock — they are all here now.';
+  } else if (still) {
+    note = still === 1
+      ? 'Log it back into stock when it lands.'
+      : 'Same job for all of them: log them back into stock as they land.';
+  }
+
+  return { digest, line, note };
 }
 
 /** Everything the Today screen needs, already decided. */
@@ -334,7 +404,7 @@ export async function todayView(focusIndex = 0, at: Date = now()): Promise<Today
    */
   const stillComing = comingBack.filter((r) => r.state !== 'returned');
   const backWithUs = comingBack.filter((r) => r.state === 'returned');
-  const cents = (rows: ShipmentRow[]) => rows.reduce((a, s) => a + s.valueCents, 0);
+  const restock = restockTexts(stillComing, backWithUs);
 
   const doneToday = await countDoneToday(at);
 
@@ -348,15 +418,7 @@ export async function todayView(focusIndex = 0, at: Date = now()): Promise<Today
       + (calls.length > 3 ? ` and ${calls.length - 3} more` : ''),
     );
   }
-  if (stillComing.length) {
-    digest.push(`${stillComing.length} ${stillComing.length === 1 ? 'parcel' : 'parcels'} coming back`
-      + ` — ${money(cents(stillComing))} to put back in stock when `
-      + `${stillComing.length === 1 ? 'it lands' : 'they land'}.`);
-  }
-  if (backWithUs.length) {
-    digest.push(`${backWithUs.length} ${backWithUs.length === 1 ? 'parcel' : 'parcels'} back with us`
-      + ` — ${money(cents(backWithUs))} to put back in stock now.`);
-  }
+  digest.push(...restock.digest);
   const other = act.length - calls.length - comingBack.length;
   if (other > 0) digest.push(`${other} other thing${other === 1 ? '' : 's'} need${other === 1 ? 's' : ''} you.`);
   if (!act.length) digest.push('Nothing else needs you.');
@@ -373,16 +435,8 @@ export async function todayView(focusIndex = 0, at: Date = now()): Promise<Today
     digest,
     focus: act.length ? act[focusIndex % act.length] : null,
     comingBack,
-    restockLine: [
-      stillComing.length
-        ? `${stillComing.length} ${stillComing.length === 1 ? 'parcel' : 'parcels'} coming back`
-          + ` (${money(cents(stillComing))})`
-        : '',
-      backWithUs.length
-        ? `${backWithUs.length} ${backWithUs.length === 1 ? 'parcel' : 'parcels'} back with us`
-          + ` (${money(cents(backWithUs))})`
-        : '',
-    ].filter(Boolean).join(' · '),
+    restockLine: restock.line,
+    restockNote: restock.note,
     doneToday,
     totalToday,
     progressLabel: totalToday ? `${doneToday} of ${totalToday} done today` : 'nothing owed today',

@@ -210,7 +210,7 @@ export async function testCorreosConnection(shippingCode: string): Promise<Corre
    * parcel sitting on our own shelf: true of nothing anybody wanted to know,
    * and the same wrong reading the timeline had.
    *
-   * `returnLegMeans` is the projection's own rule, imported rather than
+   * `returnLegReads` is the projection's own rule, imported rather than
    * repeated, so this screen and the state a parcel actually ends up in cannot
    * drift apart.
    */
