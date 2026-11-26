@@ -1914,10 +1914,41 @@ with the run already at 2, so `run === 1` was false. Fixing the count alone woul
 per box, and a worker who hears two beeps for one parcel learns to ignore the sound — which is the
 only thing that reaches them while the parcel is still in their hand.
 
-So the rule is `afterRead` in `lib/scan/direction.ts`, keyed on `readId` (which survives a resend),
-and the screen only decides *when* a read happened. It is driven read by read in
-`tests/scan-direction.test.ts`, `take` then `flush`, because the interleaving is where the bug lived
-and neither half shows it alone.
+**The first fix was not enough, and this note said it was.** Keying the rule on `readId` and letting
+both passes call it left the bug standing in the case that matters most: a warehouse morning with no
+signal. Every read passes the screen twice — `take` with the box in the hand, `flush` when the answer
+comes back — and the two see reads in different orders, because the queue is answered oldest-first.
+So the answer for a *good* box can land after the three return labels scanned behind it have already
+been counted. That answer reset the run; the next answer then looked like a fresh one; the box beeped
+a second time, and "that is 3 in a row" walked down to 1 and back up to 3 while the Switch button sat
+still underneath it. Pressing "Just this one parcel" did the same thing with one box: the answer
+brought the banner back and beeped again. No amount of care about read ids fixes that — the two
+orders are genuinely different.
+
+The rule is that **only one pass may count, and which one is a property of the direction.** The two
+wrong-direction verdicts live in different batches: a `DX` label in an Outgoing batch, which the
+phone settles from the code and the server then agrees with by construction, and an ordinary label
+read IN over a parcel Correos still has out for delivery, which needs the parcel and the phone cannot
+reach at all. `phoneSettlesEveryRead(direction)` names the owner — the phone for Outgoing, the server
+for Incoming — and the other pass leaves the run alone. That *removed* the "has this already beeped"
+bookkeeping instead of adding a second copy of it: if nothing handles a read twice, nothing has to
+remember that it did.
+
+`afterRead` is now keyed on the **code**, which is the same bug one level down. One box waved at the
+camera three times is three read ids and one parcel, and counting reads offered to re-file a batch of
+sixty over a single label. A resend carries the same code as well, so that case keeps working.
+
+Three resets, and they are not one reset. A good read breaks the run. "Just this one parcel" breaks
+it without un-saying the beep. And finishing a batch clears the banner too — `startNew` did not, so a
+new batch opened wearing the last one's banner and its run, offering to re-file a pile it had not
+seen a parcel of.
+
+`tests/scan-direction.test.ts` drives it with `take` and `answer` as *separate* steps. The driver
+this replaced answered every read inside the same loop turn that took it: it called that "the
+interleaving" and never built one, which is precisely why the suite stayed green with the bug in it.
+Above the driver, a test reads the screen and holds the shape — two places advance the run, each asks
+`phoneSettlesEveryRead` first, and exactly one of the two guards is negated — because the driver is a
+hand copy of the screen's control flow, and a copy is worth nothing once the original moves.
 
 ### Who says the parcel is back
 
@@ -1943,6 +1974,15 @@ clause should not simply go — and telling the two cases apart needs the return
 the Today row, which no column carries. The parcel's timeline already reads "Waiting for us at a
 post office" for that event.
 
+**And it was still being said two tabs away.** Fixing the reason line left the Returns tab stating
+it flatly over the same rows: the section note read "Correos delivered the return to our door and
+nobody scanned it", and the column over `returnedAt` was headed "Correos delivered it back" — in a
+section whose query is `WHERE s.returned_at IS NOT NULL`, which is to say exactly the rows that
+cannot say whether a van came. Both now say "handed it back". `returnedAt`'s own doc comment in
+`project()` said it too, in the three files that declare the field, which is how the sentence kept
+being written again; it now says what the column carries — a day, not a mode — and names the two
+events that stamp it.
+
 ### All four sentences about the pile coming back are decided in one place
 
 `restockTexts` in `lib/views/rows.ts` builds the two digest lines, the heading over "Mark as back in
@@ -1954,6 +1994,30 @@ operator clears the sixty-nine that have landed, the "back with us" half empties
 until the next return. It is pure and takes the halves rather than the rows, because all of this is
 strings and plurals, which is the part that was wrong ("1 parcels coming back"), and that makes it
 drivable from a test with no database.
+
+### Two guards that reported clean on two thirds of their subject
+
+A guard that silently reads part of its subject is worse than no guard, because it reports clean.
+Two did.
+
+The stored-label sweep in `tests/nothing-pretend.test.ts` matched `label:` followed by a
+single-quoted literal, while its own comment said "every one of them is checked, including the next
+one somebody writes". It read 14 of the 22 label sites in the files it swept and none at all in
+`lib/escalation/ladder.ts`, which writes labels of its own and hands them over as
+`rung.effect.label`; every template literal and both arms of every ternary were invisible to it. It
+now walks to the end of the expression and takes the literals out of whatever it finds there — 25 of
+them — and a second test fails on any `label:` whose value it could not read, so an unfamiliar shape
+breaks the test instead of being counted as clean.
+
+The leg filter on the attempt counts had no test at all. It is raw SQL inside a template literal,
+where nothing else checks it, and what it prevents is "Correos tried twice" being said down the
+phone to a customer when one of those two visits was the van bringing the box back to *us*. It is
+now held by reading the SQL rather than by inserting an event: one inserted event proves one
+subquery, and reading holds every subquery in the file including the next one somebody adds. The
+claim is deliberately narrow — a subquery that decides something *from* `mapped_state` must name a
+leg — because the broad claim is false. The pre-admission lateral takes a `min()` over one event
+code and needs no leg, and `lib/shipments/remap.ts` re-maps stored events by their wording, which is
+leg-independent on purpose.
 
 ### `shipment_events_dedupe_idx` was left leg-blind
 
