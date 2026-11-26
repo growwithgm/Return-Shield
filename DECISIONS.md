@@ -1899,6 +1899,62 @@ two clauses, because that strip has one button over the whole pile. The pile its
 — the job is the same for both halves — and `restockLine` is decided in `rows.ts` rather than summed
 in JSX, which is what that file's own contract says.
 
+### One read, one count — and one beep
+
+The Scanner's banner prints "That is 3 in a row. This looks like a whole pile in the wrong mode."
+next to a button that moves the whole batch, so the number is the reason the button gets pressed and
+it has to be the number of *parcels*. It counted verdicts. A `DX` label in an Outgoing batch raises
+two of them — the phone's, from the code, before the read is even sent, and the server's, which
+agrees on purpose so that a scan never carries two verdicts the phone has to choose between — so the
+whole-batch offer landed on the *second* parcel, announcing three. The one case the phone is certain
+about was the one case it could not count.
+
+The double count was also, by accident, what stopped a second beep: the server's verdict arrived
+with the run already at 2, so `run === 1` was false. Fixing the count alone would have beeped twice
+per box, and a worker who hears two beeps for one parcel learns to ignore the sound — which is the
+only thing that reaches them while the parcel is still in their hand.
+
+So the rule is `afterRead` in `lib/scan/direction.ts`, keyed on `readId` (which survives a resend),
+and the screen only decides *when* a read happened. It is driven read by read in
+`tests/scan-direction.test.ts`, `take` then `flush`, because the interleaving is where the bug lived
+and neither half shows it alone.
+
+### Who says the parcel is back
+
+`returned` is Correos' handover scan on the DX code and nothing else. The catch-up sets it with no
+warehouse scan, and sixty-nine of the eighty-seven are in exactly that state; the Returns tab lists
+those same rows as "Back with us per Correos, never scanned in" and tells the operator somebody has
+to find the box. So nothing on Today may say the box has been *seen*: the note under the restock
+strip says "Correos has handed all of these back", not "they are all here now". The heading keeps
+"back with us", which summarises what Correos say rather than claiming a shelf.
+
+For the same reason the reason line says "Correos handed it back on 19 Nov" and not "delivered it
+back to us": `returnedAt` is stamped by either ending event, `delivered` (a van at our door) or
+`collected` ("Entregado en oficina", somebody from here walking to a counter), and the row does not
+carry which — while the parcel's own timeline says the second one out loud. Likewise
+`RETURN_LEG_LABEL.refused` reads "Return refused on our side" and not "at our door": the wordings
+behind it name the addressee, which on this leg is us, and no place at all.
+
+**Still wrong, and left alone deliberately.** For a return parked at a counter waiting for us, Today
+says "Correos is sending it back from *office*" and names the **outbound** office, because
+`project()` takes the whole return leg out of the loop before `officeName` is written. When the
+parcel was held on the way out and returned from there, that sentence is right and useful, so the
+clause should not simply go — and telling the two cases apart needs the return leg's own state on
+the Today row, which no column carries. The parcel's timeline already reads "Waiting for us at a
+post office" for that event.
+
+### All four sentences about the pile coming back are decided in one place
+
+`restockTexts` in `lib/views/rows.ts` builds the two digest lines, the heading over "Mark as back in
+stock" and the note under it, together, from the two halves of the pile. They were not together, and
+the screen showed what that costs: the heading was fixed to read "18 parcels coming back (€720.00)"
+while the sentence under it, still written out in the page, said "The ones already here can be done
+now" over a half holding nobody. That is the steady state, not an edge case — the morning the
+operator clears the sixty-nine that have landed, the "back with us" half empties and stays empty
+until the next return. It is pure and takes the halves rather than the rows, because all of this is
+strings and plurals, which is the part that was wrong ("1 parcels coming back"), and that makes it
+drivable from a test with no database.
+
 ### `shipment_events_dedupe_idx` was left leg-blind
 
 The dedupe index is `(shipment_id, event_code, occurred_at)` and knows nothing
