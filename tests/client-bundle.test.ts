@@ -64,7 +64,48 @@ import { dirname, join, relative, resolve } from 'node:path';
  * a type from it, this test should not be the thing standing in the way.
  */
 const BANNED_PACKAGE = /^(postgres|nodemailer|pg-boss|exceljs|drizzle-orm\/postgres-js)$/;
-const BANNED_BUILTIN = /^node:/;
+
+/**
+ * Node builtins, WITH AND WITHOUT the `node:` prefix.
+ *
+ * `/^node:/` alone was a hole. `import { readFileSync } from 'fs'` is the same
+ * mistake with a different spelling, and `next build` answers it with
+ * `Module not found: Can't resolve 'fs'` — the same class of failure, a
+ * different message, and the guard silent. The repo has none today, which is
+ * exactly why nothing would have stopped the first.
+ */
+export const BANNED_BUILTIN = /^(node:|(assert|async_hooks|buffer|child_process|cluster|console|constants|crypto|dgram|diagnostics_channel|dns|domain|events|fs|http|http2|https|inspector|module|net|os|path|perf_hooks|process|punycode|querystring|readline|repl|stream|string_decoder|sys|timers|tls|trace_events|tty|url|util|v8|vm|wasi|worker_threads|zlib)(\/|$))/;
+
+/**
+ * Modules that are server-only by POLICY rather than by what they import, and
+ * so are invisible to the walk.
+ *
+ * `lib/carriers/correos/trackpub.ts` imports only its own normaliser, the
+ * token provider and `lib/env` — nothing banned — so the graph walk reports it
+ * clean, and a client component could import `TrackpubClient` and ship the
+ * carrier gateway's base URL and request shapes to a browser. The token
+ * provider is worse: it mints a bearer token for a live carrier account, and
+ * tests/correos-test-button.test.ts exists mostly to prove that token never
+ * leaves the server.
+ *
+ * DELIBERATELY NOT A WIDER LIST. `@/db`, `@/lib/alerts`, `@/lib/mail/*` and
+ * every `@/lib/shipments/*` module that reaches the server are already caught
+ * by the walk, which is better than naming them: it catches the next one
+ * nobody added here. And a blanket `lib/shipments/*` entry would refuse
+ * `lib/shipments/return-probe.ts` — the module the fix created precisely so a
+ * client component COULD import it. A denylist that forbids the fix is worse
+ * than no denylist.
+ */
+const SERVER_ONLY_MODULES = [
+  'lib/carriers/correos/trackpub.ts',
+  'lib/carriers/correos/token.ts',
+];
+
+/**
+ * The stand-in for a dynamic import nobody can resolve statically. Refused
+ * rather than followed — see `valueImports`.
+ */
+export const OPAQUE_DYNAMIC_IMPORT = '<dynamic import with a computed path>';
 
 export interface Offence {
   file: string;
@@ -137,6 +178,29 @@ export function valueImports(source: string): string[] {
   for (let m = sideEffect.exec(code); m; m = sideEffect.exec(code)) out.add(m[1]);
 
   /*
+   * `export { x } from './y'` and `export * from './y'`, which are import
+   * edges wearing another word. A barrel file is the obvious way to leak
+   * through this rule otherwise: one `export * from './server-thing'` in a
+   * module a client component imports, and webpack follows it while a walk
+   * that only reads `import` statements reports the file clean. There are five
+   * such edges in this repo already — `lib/messaging/index.ts` has two.
+   *
+   * The same type-erasure test applies: `export type { … } from` is erased.
+   */
+  const reExport = /\bexport\s+(?!type\b)([\s\S]*?)\s*from\s*['"]([^'"]+)['"]/g;
+  for (let m = reExport.exec(code); m; m = reExport.exec(code)) {
+    const braces = m[1].match(/\{([\s\S]*)\}/);
+    if (braces) {
+      const names = braces[1].split(',').map((n) => n.trim()).filter(Boolean);
+      if (names.length > 0 && names.every((n) => /^type\s/.test(n))) continue;
+    }
+    out.add(m[2]);
+  }
+
+  const starExport = /\bexport\s*\*\s*(?:as\s+\w+\s*)?from\s*['"]([^'"]+)['"]/g;
+  for (let m = starExport.exec(code); m; m = starExport.exec(code)) out.add(m[1]);
+
+  /*
    * And `await import('…')`, which webpack follows into a chunk of its own
    * rather than skipping. `lib/shipments/return-leg.ts` reaches the ingest
    * path exactly this way, so a module whose only server import were dynamic
@@ -144,6 +208,18 @@ export function valueImports(source: string): string[] {
    */
   const dynamic = /\bimport\s*\(\s*['"]([^'"]+)['"]/g;
   for (let m = dynamic.exec(code); m; m = dynamic.exec(code)) out.add(m[1]);
+
+  /*
+   * A dynamic import whose argument is NOT a literal — `import(spec)`, or
+   * `import(\`@/lib/${name}\`)`. Webpack does not skip those: given a template
+   * with a static prefix it builds a context module and bundles every file
+   * matching it, so one such call can pull a whole directory, and any server
+   * module in it, into the browser. There are none in this repo today, which
+   * is why it has to be refused rather than followed: the walk cannot know
+   * where it goes, so the honest answer is to make somebody say.
+   */
+  const opaque = /\bimport\s*\((?!\s*['"])/g;
+  if (opaque.test(code)) out.add(OPAQUE_DYNAMIC_IMPORT);
 
   return [...out];
 }
@@ -183,6 +259,19 @@ function chainToServer(file: string): string | null {
   const source = readFileSync(file, 'utf8');
   const here = relative(process.cwd(), file);
 
+  // Server-only by policy, asked about directly. The sweep never starts here:
+  // a `'use client'` file is never on the list. Checking the file itself as
+  // well as the files it reaches makes this ONE predicate — "this module, or
+  // anything it reaches, belongs to the server" — so the list can be tested by
+  // naming a module, instead of by hunting for a file that happens to import
+  // one and hoping that import is the first banned edge in it. Ahead of the
+  // `'use server'` check because the policy wins: the list names modules that
+  // must never be bundled whatever directive they grow later.
+  if (SERVER_ONLY_MODULES.includes(here)) {
+    cache.set(file, here);
+    return here;
+  }
+
   // The boundary. A server action's body is compiled to an RPC reference, so
   // nothing it imports reaches the browser. Checked after the memo so the
   // module is still walked when something ELSE asks about it from the server
@@ -195,12 +284,19 @@ function chainToServer(file: string): string | null {
   let found: string | null = null;
 
   for (const spec of valueImports(source)) {
+    if (spec === OPAQUE_DYNAMIC_IMPORT) {
+      found = `${here} -> ${spec}`;
+      break;
+    }
     if (BANNED_BUILTIN.test(spec) || BANNED_PACKAGE.test(spec)) {
       found = `${here} -> ${spec}`;
       break;
     }
     const next = fileFor(spec, file);
     if (!next) continue;
+    // No second copy of the policy check here: the recursive call makes it on
+    // the resolved path, so `@/…`, a relative hop and a barrel all reach the
+    // same verdict, and the chain reads the same either way.
     const deeper = chainToServer(next);
     if (deeper) { found = `${here} -> ${deeper}`; break; }
   }
@@ -293,6 +389,71 @@ describe('every client component', () => {
     // And the long notes in these files are not imports.
     expect(valueImports("/* import { x } from '@/db' */")).toEqual([]);
     expect(valueImports("// import { x } from '@/db'")).toEqual([]);
+  });
+
+  it('counts a re-export, which is an import edge wearing another word', () => {
+    /*
+     * A barrel file is the obvious way round a rule that only reads `import`
+     * statements: one `export * from './server-thing'` in a module a client
+     * component imports, and webpack follows it while the walk reports the
+     * file clean. Five such edges exist in this repo already.
+     */
+    expect(valueImports("export { x } from '@/db';")).toEqual(['@/db']);
+    expect(valueImports("export * from '@/db';")).toEqual(['@/db']);
+    expect(valueImports("export * as db from '@/db';")).toEqual(['@/db']);
+    // Erased, so not an edge — which is what makes the return-probe split work.
+    expect(valueImports("export type { A } from '@/db';")).toEqual([]);
+    expect(valueImports("export { type A, type B } from '@/db';")).toEqual([]);
+    expect(valueImports("export { type A, b } from '@/db';")).toEqual(['@/db']);
+  });
+
+  it('refuses a dynamic import nobody can resolve, rather than following it', () => {
+    /*
+     * Given a template with a static prefix webpack builds a context module
+     * and bundles every file matching it, so one such call can pull a whole
+     * directory — and any server module in it — into the browser. The walk
+     * cannot know where it goes, so the honest answer is to make somebody say.
+     * There are none in this repo today.
+     */
+    expect(valueImports('const m = await import(spec);')).toEqual([OPAQUE_DYNAMIC_IMPORT]);
+    expect(valueImports('const m = await import(`@/lib/${name}`);')).toEqual([OPAQUE_DYNAMIC_IMPORT]);
+    // A literal is resolvable and is followed normally.
+    expect(valueImports("const m = await import('@/db');")).toEqual(['@/db']);
+  });
+
+  it('refuses the carrier gateway and the token minter by name', () => {
+    /*
+     * The two modules that are server-only by POLICY rather than by what they
+     * import, and so are invisible to the walk: `trackpub.ts` imports only its
+     * own normaliser, the token provider and `lib/env`, and the token provider
+     * mints a bearer token for a live carrier account.
+     */
+    expect(chainToServer(join(process.cwd(), 'lib/carriers/correos/trackpub.ts')))
+      .toContain('lib/carriers/correos/trackpub.ts');
+    expect(chainToServer(join(process.cwd(), 'lib/carriers/correos/token.ts')))
+      .toContain('lib/carriers/correos/token.ts');
+
+    /*
+     * And NOT a wider list. A blanket `lib/shipments/*` entry — which is how
+     * the rule was first described — would refuse `return-probe.ts`, the
+     * module the fix created precisely so a client component could import it.
+     * A denylist that forbids the fix is worse than no denylist, so the walk
+     * does that half of the job.
+     */
+    expect(chainToServer(join(process.cwd(), 'lib/shipments/return-probe.ts'))).toBeNull();
+  });
+
+  it('refuses a node builtin written without its prefix', () => {
+    // `import { readFileSync } from 'fs'` is the same mistake as 'node:fs',
+    // and `next build` answers it with "Can't resolve 'fs'".
+    for (const spec of ['fs', 'crypto', 'child_process', 'async_hooks', 'path']) {
+      expect(BANNED_BUILTIN.test(spec), spec).toBe(true);
+      expect(BANNED_BUILTIN.test(`node:${spec}`), spec).toBe(true);
+    }
+    // And does not catch a package that merely starts the same way.
+    for (const spec of ['pathe', 'crypto-js', 'fs-extra', 'react', 'next/link']) {
+      expect(BANNED_BUILTIN.test(spec), spec).toBe(false);
+    }
   });
 
   it('stops at a server action, which is a boundary and not a leak', () => {
