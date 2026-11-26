@@ -341,7 +341,8 @@ export const STATE_LABEL_SHORT: Record<string, string> = {
  *   `bad_address` `H01R421V` on the return leg, which is Correos saying the
  *                 address they are returning it TO is wrong — i.e. ours, the
  *                 one RETURN_POSTCODE put in the code.
- *   `refused`     somebody at our end turned the return away at the door.
+ *   `refused`     somebody at our end turned the return away. WHERE is not
+ *                 in any of the wordings behind it, so the label does not say.
  *   `returning`   a DEVOLUCION-phase event on the return shipment itself. It
  *                 says the return is being sent back and NOT where to, so the
  *                 label says only that.

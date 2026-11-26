@@ -22,8 +22,8 @@ import { MoveToOutgoing } from './MoveToOutgoing';
  *   filed as strangers — the only `DX` labels in the table. A return travels
  *   under a code of Correos' own and nothing here knew what one was.
  *
- *   And sixty-nine were on neither list. Correos had delivered them back to
- *   our door and nobody scanned them in, so a screen built entirely out of
+ *   And sixty-nine were on neither list. Correos had handed them back and
+ *   nobody scanned them in, so a screen built entirely out of
  *   scans could not show them at all. That is the fourth section, and it is
  *   read from the parcels rather than from the scans.
  *
@@ -86,7 +86,7 @@ export function ReturnsPanel({ view }: { view: ReturnsView }) {
 
       <Section
         title="Back with us per Correos, never scanned in"
-        note="Correos delivered the return to our door and nobody scanned it. Somebody has to find the box."
+        note="Correos has handed the return back and nobody scanned it. Somebody has to find the box."
         count={view.awaitedTotal}
         empty="Nothing waiting."
         show={view.awaited.length > 0}
@@ -283,7 +283,7 @@ function Check({ rows }: { rows: ReturnRow[] }) {
 }
 
 /**
- * Correos brought it back to our door and nobody scanned it in.
+ * Correos has handed it back and nobody scanned it in.
  *
  * Sixty-nine of the eighty-seven returns were in this state, and no screen
  * could show them: this one was built entirely out of scans, and there is no
@@ -299,7 +299,7 @@ function Awaited({ rows }: { rows: AwaitedReturn[] }) {
           <tr>
             <Th>Order</Th>
             <Th>Where Correos says it is</Th>
-            <Th>Correos delivered it back</Th>
+            <Th>Correos handed it back</Th>
             <Th>Look for this code</Th>
           </tr>
         </thead>

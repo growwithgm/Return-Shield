@@ -107,9 +107,16 @@ export interface Projection {
    */
   preAdmittedAt: Date | null;
   /**
-   * When Correos delivered the return back to US, from the return leg's own
-   * delivery event. Null until then, and null for the great majority of
-   * parcels, which never come back.
+   * The day the return leg changed hands, from the leg's own handover event.
+   * Null until then, and null for the great majority of parcels, which never
+   * come back.
+   *
+   * A DAY, NOT A MODE. Two events stamp it, and `returnLegMeans` above counts
+   * both: `delivered`, which is a van at our door, and `collected`, which is
+   * somebody fetching the box off a counter ("entregado en oficina"). This
+   * field does not carry which, and no other column does either — so nothing
+   * built on it may say a van brought it, or name a place. See
+   * lib/escalation/decide.ts, which says only "Correos handed it back".
    */
   returnedAt: Date | null;
   eventCount: number;

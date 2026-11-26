@@ -37,7 +37,7 @@ export interface ShipmentRow extends DecidableShipment {
   returnCode: string | null;
   /** Whether Correos named it or we worked it out. See return-code.ts. */
   returnCodeSource: string | null;
-  /** When Correos delivered the return back to US. */
+  /** The day the return leg changed hands. A day, not a mode: see project.ts. */
   returnedAt: Date | null;
   orderNumber: string;
   storeName: string;

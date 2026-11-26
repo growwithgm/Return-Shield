@@ -38,7 +38,7 @@ import { scanMark, type ScanMark } from './scans';
  *                       before the return arrived. Real parcels either way.
  *
  *   Back per Correos, never scanned in   the other way round, and it was
- *                       invisible: Correos delivered the return to our door
+ *                       invisible: Correos had handed the return back
  *                       and the warehouse never scanned it. Sixty-nine of the
  *                       eighty-seven returns were in this state. It is read
  *                       from the shipments rather than from the scans, which
@@ -133,7 +133,7 @@ export interface ReturnsView {
   check: ReturnRow[];
   /** Nothing matched: before Return Shield, or cleaned up before it came back. */
   theirs: ReturnRow[];
-  /** Correos brought it back to our door and nobody scanned it in. */
+  /** Correos has handed it back and nobody scanned it in. */
   awaited: AwaitedReturn[];
   mineTotal: number;
   checkTotal: number;
@@ -316,8 +316,8 @@ export const returnsView = retryableRead('returns', async (
     /*
      * THE OTHER WAY ROUND, AND IT WAS INVISIBLE.
      *
-     * Correos delivered the return to our door and the warehouse never scanned
-     * it in. Sixty-nine of the eighty-seven returns were in exactly this state
+     * Correos has handed the return back and the warehouse never scanned it
+     * in. Sixty-nine of the eighty-seven returns were in exactly this state
      * — back in the building, with nothing in Return Shield saying so and
      * nothing on this screen either, because this screen was built entirely
      * out of scans.

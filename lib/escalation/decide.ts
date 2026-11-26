@@ -36,8 +36,8 @@ export interface DecidableShipment {
   officeArrivedAt: Date | null;
   officeName: string | null;
   /**
-   * When Correos delivered the return back to US, from the return leg's own
-   * delivery event. See lib/state-machine/project.ts.
+   * The day the return leg changed hands, from the leg's own handover event.
+   * A day, not a mode — see lib/state-machine/project.ts.
    *
    * Here because the reason line for a parcel that is BACK is the day it
    * landed, and this is the only date that says so: `officeArrivedAt` is the
