@@ -92,9 +92,21 @@ export async function logCall(
       await silence(shipmentId, { keepFinal: false });
       await closeTasks(shipmentId, ['call', 'contact'], { outcome, note });
       await getDb().update(orders).set({ repeatRisk: true }).where(eq(orders.id, ctx.orderId));
+      /*
+       * "Put back in stock", NOT "when it lands".
+       *
+       * A task's label is a STORED STRING, written now and read for as long as
+       * the task is open. This one is written during a call, when the parcel is
+       * still at a counter or waiting on a failed delivery — and it is still
+       * there a fortnight later when Correos have brought the box back and it
+       * is on the bench, at which point it tells the operator to wait for a
+       * parcel they are holding. It was the only one of the five
+       * `receive_return` labels carrying that clause; the other four already
+       * read plain. The parcel's own screens say where it is.
+       */
       await openTask({
         shipmentId, type: 'receive_return', reason: 'customer_refused_on_call',
-        label: 'Put back in stock when it lands',
+        label: 'Put back in stock',
       });
       await say(`${ctx.name} — doesn't want it, ${money(ctx.valueCents)} lost, ready to go back in stock`, shipmentId);
       const { raiseAlert } = await import('@/lib/alerts');

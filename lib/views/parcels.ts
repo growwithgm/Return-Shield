@@ -401,12 +401,33 @@ function base(): SQL {
             FROM shipment_events e
            WHERE e.shipment_id = s.id AND e.event_code = 'A090000V'
         ) pre ON true
-        -- How many times Correos tried and found nobody. Shown on the row, so
-        -- the operator can say "they have tried twice" on the phone.
+        /*
+         * How many times Correos tried the CUSTOMER and found nobody. Shown on
+         * the row, so the operator can say "they have tried twice" on the
+         * phone - which is why the leg filter below is not optional either.
+         *
+         * A delivered return leg always carries an out_for_delivery of its own
+         * - G01L010V, the van bringing the box to OUR door - and on a return
+         * that started with a wrong address office_arrived_at is NULL, so the
+         * date guard is true for every event on the parcel. Measured against a
+         * real Postgres on exactly that parcel: tried came back 2 where the
+         * customer was tried once.
+         *
+         * It is not operator-visible today: both counts are consumed only
+         * behind an at_office gate (the missed_delivery predicate, and
+         * attempts, which only ContactTable draws), and a returned parcel is
+         * not at_office. Fixed because the number was wrong, not because
+         * anybody had seen it.
+         *
+         * (No backticks in here. This is a SQL comment inside a JavaScript
+         * template literal, and a backtick ends the literal - which has now
+         * broken this file's build five separate times.)
+         */
         LEFT JOIN LATERAL (
           SELECT count(*)::int AS n
             FROM shipment_events e
            WHERE e.shipment_id = s.id
+             AND e.leg = 'outbound'
              AND e.mapped_state = 'failed'
              AND (s.office_arrived_at IS NULL OR e.occurred_at <= s.office_arrived_at)
         ) attempts ON true
@@ -416,6 +437,7 @@ function base(): SQL {
           SELECT count(*)::int AS n
             FROM shipment_events e
            WHERE e.shipment_id = s.id
+             AND e.leg = 'outbound'
              AND e.mapped_state = 'out_for_delivery'
              AND (s.office_arrived_at IS NULL OR e.occurred_at <= s.office_arrived_at)
         ) tried ON true

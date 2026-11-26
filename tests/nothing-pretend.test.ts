@@ -252,6 +252,62 @@ describe('the restock buttons', () => {
   });
 });
 
+describe('the labels stored on a task', () => {
+  /*
+   * A TASK LABEL IS A STORED STRING, written once and read for as long as the
+   * task is open — so it must not promise a state the parcel will have moved
+   * past. One of the five `receive_return` labels read "Put back in stock when
+   * it lands", written during a call while the parcel was still at a counter,
+   * and it was still saying it a fortnight later with the box on the bench: it
+   * told the operator to wait for a parcel they were holding.
+   *
+   * Read as source text rather than by calling the openers, because that is
+   * what makes it total: every one of them is checked, including the next one
+   * somebody writes.
+   */
+  const OPENERS = [
+    'lib/shipments/ingest.ts',
+    'lib/escalation/outcomes.ts',
+    'lib/escalation/run.ts',
+    'lib/escalation/tasks.ts',
+  ];
+
+  /** Every `label:` passed to an openTask call in these files. */
+  function labels(): { file: string; label: string }[] {
+    return OPENERS.flatMap((file) => {
+      const src = codeOf(file);
+      const out: { file: string; label: string }[] = [];
+      const pattern = /label:\s*'([^']*)'/g;
+      for (let m = pattern.exec(src); m; m = pattern.exec(src)) {
+        out.push({ file, label: m[1] });
+      }
+      return out;
+    });
+  }
+
+  it('is actually finding them — an empty sweep would pass by accident', () => {
+    const found = labels();
+    expect(found.map((l) => l.label)).toContain('Put back in stock');
+    // The five receive_return openers, plus the ladder's own.
+    expect(found.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it('promises nothing about where the parcel will be later', () => {
+    /*
+     * "when it lands", "once it arrives", "on arrival" — each of them is true
+     * on the day it is written and false for the rest of the task's life. The
+     * parcel's own screens say where it is; a label says what the job is.
+     */
+    const AGEING = ['when it lands', 'once it arrives', 'on arrival', 'when it arrives'];
+
+    const offenders = labels()
+      .filter((l) => AGEING.some((p) => l.label.toLowerCase().includes(p)))
+      .map((l) => `${l.file} — "${l.label}"`);
+
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe('the Correos buttons that only record', () => {
   it('say "Mark", because nothing here talks to Correos', () => {
     const base: DecidableShipment = {
