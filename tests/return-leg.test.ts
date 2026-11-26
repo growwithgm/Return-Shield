@@ -84,7 +84,11 @@ describe('reading a return leg in English', () => {
     // `H01R421V` on the return leg is Correos saying the address they are
     // returning it TO is wrong — ours, the one RETURN_POSTCODE put in the code.
     expect(eventStateLabel('bad_address', 'return')).toBe('Correos says our returns address is wrong');
-    expect(eventStateLabel('refused', 'return')).toBe('Return refused at our door');
+    // "On our side", not "at our door": the wordings behind `refused` name the
+    // addressee, which on this leg is us, and no place at all — and this same
+    // leg leaves parcels at counters.
+    expect(eventStateLabel('refused', 'return')).toBe('Return refused on our side');
+    expect(eventStateLabel('refused', 'return')).not.toMatch(/door|office|counter/);
 
     // And every state says something different about the way back. The table
     // being total is what lets `eventStateLabel` refuse to guess, below.
@@ -167,7 +171,22 @@ describe('the reason line on Today', () => {
 
   it('says the day a returned parcel landed', () => {
     const why = nextAction(back({ returnedAt: new Date('2026-11-19T09:37:00Z') }))?.why;
-    expect(why).toBe('Correos delivered it back to us on 19 Nov');
+    expect(why).toBe('Correos handed it back on 19 Nov');
+  });
+
+  it('does not say a van brought it, for a parcel fetched from a counter', () => {
+    /*
+     * `returnedAt` is stamped by either handover event — `delivered`, a van at
+     * our door, and `collected`, "Entregado en oficina", which is somebody
+     * from here walking to a counter to get it. The row does not carry which,
+     * and the timeline for the second one reads "Back with us (collected at a
+     * Correos counter)". So the reason line must not pick one.
+     */
+    expect(returnLegMeans('delivered')).toBe('returned');
+    expect(returnLegMeans('collected')).toBe('returned');
+    const why = nextAction(back({ returnedAt: new Date('2026-11-19T09:37:00Z') }))?.why ?? '';
+    expect(why).not.toMatch(/delivered|to our door|van/i);
+    expect(why).toContain('19 Nov');
   });
 
   it('says only that it is here when no date was recorded', () => {

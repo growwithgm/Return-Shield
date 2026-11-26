@@ -353,14 +353,25 @@ export function restockTexts(
    * The job is the same for both halves — log the stock back in — and the
    * only question is which of them can be done this morning. So the note
    * names a half only when that half holds something.
+   *
+   * AND IT SAYS WHO SAYS SO. `returned` is Correos' handover scan on the DX
+   * code and nothing else: the catch-up sets it without any warehouse scan,
+   * and sixty-nine of the eighty-seven are in exactly that state. The
+   * Returns tab lists those same rows under "Back with us per Correos, never
+   * scanned in" and tells the operator somebody has to find the box. A note
+   * here reading "they are all here now" contradicted it, on the screen the
+   * operator starts the morning on. What is certain is that Correos have
+   * handed them over; where the box is standing is not.
    */
   let note = '';
   if (still && here) {
-    note = 'Same job for all of them: log them back into stock. The ones already here can be done now.';
+    note = 'Same job for all of them: log them back into stock.'
+      + ' The ones Correos has handed back can be done now.';
   } else if (here) {
     note = here === 1
-      ? 'Log it back into stock: it is here now.'
-      : 'Same job for all of them: log them back into stock — they are all here now.';
+      ? 'Log it back into stock: Correos has handed it back.'
+      : 'Same job for all of them: log them back into stock —'
+        + ' Correos has handed all of these back.';
   } else if (still) {
     note = still === 1
       ? 'Log it back into stock when it lands.'

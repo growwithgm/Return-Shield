@@ -278,8 +278,20 @@ function whyComingBack(
   if (s.state === 'refused') return "Customer didn't want it";
 
   if (s.state === 'returned') {
+    /*
+     * "HANDED IT BACK", NOT "DELIVERED IT TO US". `returnedAt` is the day the
+     * return leg changed hands, and it is stamped from either of the two
+     * events that can do that: `delivered`, a van at our door, and
+     * `collected`, "Entregado en oficina" — somebody from here walking to a
+     * counter to fetch it. The row does not carry which, and the parcel's own
+     * timeline says so out loud: `RETURN_LEG_LABEL.collected` reads "Back
+     * with us (collected at a Correos counter)". A card that said "Correos
+     * delivered it back to us on 23 Nov" over that timeline gave the operator
+     * two accounts of one handover, and the one with the van in it was the
+     * invented one.
+     */
     return s.returnedAt
-      ? `Correos delivered it back to us on ${shortDate(s.returnedAt)}`
+      ? `Correos handed it back on ${shortDate(s.returnedAt)}`
       : 'It is back with us';
   }
 

@@ -385,6 +385,20 @@ describe('the pile coming back, as Today says it', () => {
     expect(said(1, 0)).not.toMatch(/already here|here now/);
   });
 
+  it('never says the box has been seen, because nobody has seen it', () => {
+    /*
+     * `returned` is Correos' handover scan on the DX code and nothing else —
+     * the catch-up sets it with no warehouse scan, and sixty-nine of the
+     * eighty-seven are in that state. The Returns tab lists those same rows
+     * as "Back with us per Correos, never scanned in" and says somebody has
+     * to find the box. Today must not contradict it one tab away.
+     */
+    for (const shape of [said(0, 69), said(0, 1), said(18, 69)]) {
+      expect(shape).not.toMatch(/here now|all here|on the shelf/);
+      expect(shape).toMatch(/Correos has handed/);
+    }
+  });
+
   it('never says one is still on its way when none is', () => {
     expect(said(0, 69)).not.toMatch(/when they land|when it lands|as they land/);
     expect(said(0, 1)).not.toMatch(/when they land|when it lands|as they land/);
@@ -394,7 +408,7 @@ describe('the pile coming back, as Today says it', () => {
     const both = restockTexts(pile(18, 4000), pile(69, 6490));
     expect(both.digest).toHaveLength(2);
     expect(both.line).toBe('18 parcels coming back (€720.00) · 69 parcels back with us (€4478.10)');
-    expect(both.note).toContain('The ones already here can be done now');
+    expect(both.note).toContain('The ones Correos has handed back can be done now');
   });
 
   it('counts the money of each half over that half only', () => {

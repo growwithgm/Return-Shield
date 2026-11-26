@@ -366,7 +366,12 @@ export const RETURN_LEG_LABEL: Record<string, string> = {
   collected: 'Back with us (collected at a Correos counter)',
   delivered: 'Back with us',
   bad_address: 'Correos says our returns address is wrong',
-  refused: 'Return refused at our door',
+  // NOT "at our door". The only wordings behind `refused` are "Envío rehusado
+  // por el destinatario" and its two aliases, which say the addressee turned
+  // it down — on this leg the addressee is us — and say nothing about where.
+  // The same leg puts parcels at counters (`at_office`, `collected`), so a
+  // refusal on our side can happen at one.
+  refused: 'Return refused on our side',
   returning: 'The return itself is being sent back',
   // Not reachable from an event. See the note above.
   returned: 'Back with us',
