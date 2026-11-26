@@ -2,8 +2,12 @@ import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { getDb } from '@/db';
 import { scanBatches, scans } from '@/db/schema';
+import { readFileSync } from 'node:fs';
 import { parseCorreosCode } from '@/lib/scan/codes';
-import { doubtFromCode, doubtFromParcel, DOUBT_RUN } from '@/lib/scan/direction';
+import {
+  DOUBT_RUN, NO_DOUBT_RUN, afterRead, alreadyCounted, doubtFromCode, doubtFromParcel,
+  type DirectionDoubt,
+} from '@/lib/scan/direction';
 import {
   addScan, moveBatchDirection, moveScanDirection, openBatch, switchBatchDirection,
 } from '@/lib/scan/batches';
@@ -248,5 +252,167 @@ describe('moving a pile that went the wrong way', () => {
     const batch = await openBatch(other, 'incoming');
 
     expect(await switchBatchDirection(worker, batch.id, 'outgoing')).toBeNull();
+  });
+});
+
+/**
+ * How many in a row, and how many beeps.
+ *
+ * The banner prints "That is 3 in a row. This looks like a whole pile in the
+ * wrong mode." next to a button that moves the whole batch, so the number is
+ * not decoration: it is the reason the worker presses it. It has to be the
+ * number of PARCELS they have read.
+ *
+ * The screen counted verdicts instead, and a DX label in an Outgoing batch
+ * raises two of them — the phone's, from the code, before the read is sent,
+ * and the server's, which agrees on purpose (see the test above). So two DX
+ * labels announced three in a row, and the one thing the phone is CERTAIN
+ * about was the one thing it could not count. Nobody saw it while the
+ * banner's title was keyed off a field nothing set.
+ *
+ * The beep is the other half. The phone beeps when a run STARTS, and the
+ * second verdict for the same box must not beep again: a worker who hears two
+ * beeps for one parcel learns to ignore the sound, and the sound is the only
+ * thing that reaches them while the parcel is still in their hand.
+ *
+ * `shift` below drives the rule the way ScannerApp does — `take` first, then
+ * `flush` when the read comes back — because that interleaving is where the
+ * double count lived, not in either half on its own.
+ */
+/**
+ * The two sentences the banner shows, together.
+ *
+ * They are written in two files — the title in the screen, the body in the
+ * verdict — and until the title rendered at all nobody read them one after
+ * the other. They said the same thing: "This is a return label", then "This
+ * is a return label — the parcel came back to us." The pair is the unit, so
+ * this test holds both ends of it.
+ */
+describe('what the wrong-way banner says', () => {
+  const SCREEN = readFileSync('components/scan/ScannerApp.tsx', 'utf8');
+
+  function titleFor(kind: DirectionDoubt): string {
+    // The screen picks the title from the verdict's kind. Read both arms out
+    // of the file rather than copying them, so a reworded title is caught
+    // here instead of going quietly out of step with the body.
+    const arms = SCREEN.match(
+      /doubt\.kind === 'return-in-outgoing'\s*\n\s*\? '([^']+)'\s*\n\s*: '([^']+)'/,
+    );
+    expect(arms, 'the banner still chooses its title by kind').not.toBeNull();
+    return kind === 'return-in-outgoing' ? arms![1] : arms![2];
+  }
+
+  it('does not say the same thing twice', () => {
+    for (const verdict of [
+      doubtFromCode(parseCorreosCode(BACK)!, 'outgoing')!,
+      doubtFromParcel(parseCorreosCode(OUT)!, 'incoming', { state: 'out_for_delivery' })!,
+    ]) {
+      const title = titleFor(verdict.doubt);
+      expect(title.length).toBeGreaterThan(0);
+      // Not "starts with": any overlap at all reads as a stutter when the two
+      // lines sit three millimetres apart on a phone.
+      expect(verdict.message.toLowerCase()).not.toContain(title.toLowerCase());
+    }
+  });
+
+  it('names the return label in the title, where the worker reads it first', () => {
+    // What the screen was always meant to say for a DX code, and could not.
+    expect(titleFor('return-in-outgoing')).toBe('This is a return label');
+  });
+
+  it('never offers "It really went out" against a code that says it came back', () => {
+    /*
+     * The dismiss button only clears the banner — the scan stays filed in
+     * this batch either way. Against the server's verdict, which is a guess
+     * from the parcel's state, "It really went out" is a fair thing to offer:
+     * the worker holding the box may know better than Correos. Against a DX
+     * code it is not. There is nothing the worker can know that makes it
+     * true, and a button that invites them to say it is how a parcel on the
+     * shelf gets recorded as having left the building.
+     */
+    const dismiss = SCREEN.slice(SCREEN.indexOf("setDoubt(null); doubtRun.current = NO_DOUBT_RUN"));
+    const arm = dismiss.match(/doubt\.kind === 'return-in-outgoing'\s*\n\s*\? '([^']+)'/);
+    expect(arm, 'the dismiss button still chooses its words by kind').not.toBeNull();
+    expect(arm![1]).not.toMatch(/went out|came back/i);
+  });
+});
+
+describe('counting the reads that look wrong', () => {
+  type Read = {
+    id: string;
+    /** The phone settled it from the code: a DX label in an Outgoing batch. */
+    instant: boolean;
+    /** What the server said when the read came back, or nothing yet. */
+    flush?: boolean;
+  };
+
+  function shift(reads: readonly Read[]): { count: number; beeps: string[] } {
+    let run = NO_DOUBT_RUN;
+    const beeps: string[] = [];
+    for (const r of reads) {
+      if (r.instant) {
+        run = afterRead(run, r.id, true);
+        beeps.push(`${r.id}:phone`);
+      }
+      if (r.flush !== undefined) {
+        const beeped = alreadyCounted(run, r.id);
+        run = afterRead(run, r.id, r.flush);
+        if (r.flush && !beeped && run.count === 1) beeps.push(`${r.id}:server`);
+      }
+    }
+    return { count: run.count, beeps };
+  }
+
+  /** A DX return label read into an Outgoing batch: both halves fire. */
+  const DX = (id: string): Read => ({ id, instant: true, flush: true });
+  /** An ordinary label the server doubts: only the server fires. */
+  const FROM_SERVER = (id: string): Read => ({ id, instant: false, flush: true });
+  /** A read the server was happy with. */
+  const GOOD = (id: string): Read => ({ id, instant: false, flush: false });
+
+  it('counts one DX label as one parcel, and beeps once', () => {
+    expect(shift([DX('a')])).toEqual({ count: 1, beeps: ['a:phone'] });
+  });
+
+  it('counts two DX labels as two, not three', () => {
+    // The whole bug, in one line.
+    expect(shift([DX('a'), DX('b')]).count).toBe(2);
+  });
+
+  it('beeps once per parcel, never twice for one box', () => {
+    expect(shift([DX('a'), DX('b')]).beeps).toEqual(['a:phone', 'b:phone']);
+  });
+
+  it('offers the whole-batch switch on the third parcel, not the second', () => {
+    expect(shift([DX('a'), DX('b')]).count).toBeLessThan(DOUBT_RUN);
+    expect(shift([DX('a'), DX('b'), DX('c')]).count).toBe(DOUBT_RUN);
+  });
+
+  it('counts a read that had to be sent twice once', () => {
+    // A lost response: the phone counted it, then the queue resent the same
+    // readId and the server answered the same verdict both times.
+    const resent: Read[] = [
+      { id: 'a', instant: true },
+      { id: 'a', instant: false, flush: true },
+      { id: 'a', instant: false, flush: true },
+    ];
+    expect(shift(resent)).toEqual({ count: 1, beeps: ['a:phone'] });
+  });
+
+  it('still counts one per read when only the server doubts it', () => {
+    // The 20 and 25 November case, which the phone cannot see coming.
+    expect(shift([FROM_SERVER('a'), FROM_SERVER('b'), FROM_SERVER('c')]).count).toBe(3);
+    expect(shift([FROM_SERVER('a')]).beeps).toEqual(['a:server']);
+  });
+
+  it('starts again after a read the server was happy with', () => {
+    expect(shift([DX('a'), GOOD('g')]).count).toBe(0);
+    expect(shift([DX('a'), DX('b'), GOOD('g'), DX('c')]).count).toBe(1);
+  });
+
+  it('holds nothing before the first read', () => {
+    expect(NO_DOUBT_RUN.count).toBe(0);
+    expect(alreadyCounted(NO_DOUBT_RUN, 'a')).toBe(false);
+    expect(afterRead(NO_DOUBT_RUN, 'a', false)).toEqual(NO_DOUBT_RUN);
   });
 });

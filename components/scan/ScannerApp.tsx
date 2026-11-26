@@ -4,7 +4,8 @@ import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { parseCorreosCode, type CorreosCode } from '@/lib/scan/codes';
 import {
-  DOUBT_RUN, doubtFromCode, type DirectionDoubt, type DirectionVerdict,
+  DOUBT_RUN, NO_DOUBT_RUN, afterRead, alreadyCounted, doubtFromCode,
+  type DirectionDoubt, type DirectionVerdict, type DoubtRun,
 } from '@/lib/scan/direction';
 import { summarise, type Batch, type ScanItem } from '@/lib/scan/items';
 import { DIRECTION_LABEL, type ScanDirection, type ScanSource } from '@/lib/scan/model';
@@ -132,7 +133,12 @@ export function ScannerApp({
    * not three parcels scattered through a good one.
    */
   const [doubt, setDoubt] = useState<Doubt | null>(null);
-  const doubtRun = useRef(0);
+  /*
+   * ONE READ, ONE COUNT — see `afterRead` in lib/scan/direction.ts, which
+   * holds the rule so it can be driven read by read in a test. This file only
+   * decides WHEN a read happened; it does not get to decide what counts.
+   */
+  const doubtRun = useRef<DoubtRun>(NO_DOUBT_RUN);
 
   // Refs for the things the flush loop and the decode loop read. Both run
   // outside React's render, and both must see the latest value rather than the
@@ -251,14 +257,22 @@ export function ScannerApp({
          * flash it over an unrelated parcel.
          */
         if (body.doubt) {
-          doubtRun.current += 1;
-          const run = doubtRun.current;
+          /*
+           * The phone may have settled this same read already, from the code
+           * alone. Then it is not a new parcel and it has already beeped: the
+           * banner is refreshed, the count is not raised, and the phone stays
+           * quiet. Beeping twice for one box is how a worker learns to ignore
+           * the sound.
+           */
+          const beeped = alreadyCounted(doubtRun.current, read.readId);
+          doubtRun.current = afterRead(doubtRun.current, read.readId, true);
+          const run = doubtRun.current.count;
           setDoubt(doubtVerdict(body.doubt, body.item.codeAsRead, run));
-          if (run === 1) beepWrongWay();
+          if (!beeped && run === 1) beepWrongWay();
         } else {
           // A read the server was happy with breaks the run: three in a row is
           // a pile, three scattered through sixty is not.
-          doubtRun.current = 0;
+          doubtRun.current = afterRead(doubtRun.current, read.readId, false);
         }
       }
     } finally {
@@ -317,8 +331,8 @@ export function ScannerApp({
     if (instant) {
       beepWrongWay();
       setFlash({ kind: 'wrong-way', base: code.base, at: Date.now() });
-      doubtRun.current += 1;
-      setDoubt(doubtVerdict(instant, code.raw, doubtRun.current));
+      doubtRun.current = afterRead(doubtRun.current, read.readId, true);
+      setDoubt(doubtVerdict(instant, code.raw, doubtRun.current.count));
     } else if (already) {
       beepDuplicate();
       setFlash({ kind: 'duplicate', base: code.base, at: Date.now() });
@@ -343,7 +357,7 @@ export function ScannerApp({
     const id = batchIdRef.current;
     if (!id) return;
     setDoubt(null);
-    doubtRun.current = 0;
+    doubtRun.current = NO_DOUBT_RUN;
     try {
       const res = await fetch('/api/scan/batch', {
         method: 'PATCH',
@@ -654,8 +668,15 @@ export function ScannerApp({
         * warning is to scan it again, and a second read of the same label is
         * the one thing that cannot help.
         *
-        * Two buttons and no cancel: either the pile is going out, or it really
-        * came back. Both are one tap, and both are honest about what they do.
+        * Two buttons and no cancel: either the whole pile is in the wrong mode,
+        * or it is this one parcel. Both are one tap, and both are honest about
+        * what they do — which is why the second one is not always worded the
+        * same. "It really went out" is a fair thing to offer against a verdict
+        * the SERVER guessed from the parcel's state: the worker holding the box
+        * may know better than Correos. It is not a fair thing to offer against
+        * a DX code, which says the parcel came back and cannot be mistaken
+        * about it, so there the button says what it does — leaves this one
+        * parcel alone — and claims nothing about the label.
         */}
       {doubt && (
         <div
@@ -694,10 +715,12 @@ export function ScannerApp({
             </button>
             <button
               type="button"
-              onClick={() => { setDoubt(null); doubtRun.current = 0; }}
+              onClick={() => { setDoubt(null); doubtRun.current = NO_DOUBT_RUN; }}
               className="h-11 flex-1 rounded-[10px] border border-line bg-surface px-3 text-[14px] font-semibold text-navy"
             >
-              {doubt.shouldBe === 'outgoing' ? 'It really came back' : 'It really went out'}
+              {doubt.kind === 'return-in-outgoing'
+                ? 'Just this one parcel'
+                : doubt.shouldBe === 'outgoing' ? 'It really came back' : 'It really went out'}
             </button>
           </div>
         </div>

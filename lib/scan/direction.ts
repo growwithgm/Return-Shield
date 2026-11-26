@@ -92,7 +92,15 @@ export function doubtFromCode(
     return {
       doubt: 'return-in-outgoing',
       shouldBe: 'incoming',
-      message: 'This is a return label — the parcel came back to us.',
+      /*
+       * NOT "This is a return label — …". The banner puts that in its own
+       * title for this verdict, and until the title actually rendered (it was
+       * keyed off a field nothing set) nobody saw the two together: the box
+       * read "This is a return label" and then, one line down, "This is a
+       * return label — the parcel came back to us." One of the two carries
+       * the sentence, and the title is the one the worker reads first.
+       */
+      message: 'The parcel came back to us.',
     };
   }
   return null;
@@ -135,3 +143,48 @@ export function doubtFromParcel(
  * twenty-seven left to save.
  */
 export const DOUBT_RUN = 3;
+
+/**
+ * A run of doubtful reads, and which reads have already been counted into it.
+ *
+ * `count` is the number the banner prints, so it has to be the number of
+ * PARCELS the worker has read — not the number of verdicts the app has
+ * handled. Those differ for exactly one case: a DX label in an Outgoing
+ * batch, which the phone settles from the code before the read is even sent
+ * and which the server then agrees with on purpose (see `doubtFromParcel`).
+ * Counting both landed the same parcel twice, so two DX labels announced
+ * "That is 3 in a row" to a worker who had read two.
+ *
+ * `counted` holds readIds, and a readId survives a resend, so a lost response
+ * that comes back twice is still one parcel.
+ */
+export type DoubtRun = {
+  readonly count: number;
+  readonly counted: readonly string[];
+};
+
+/** No doubtful reads: where a batch starts, and what any good read restores. */
+export const NO_DOUBT_RUN: DoubtRun = { count: 0, counted: [] };
+
+/**
+ * Whether this read is already in the run.
+ *
+ * The phone needs this as well as the count: it beeps when a run STARTS, and
+ * a read it has already beeped for must not beep again when the server sends
+ * the same verdict back.
+ */
+export function alreadyCounted(run: DoubtRun, readId: string): boolean {
+  return run.counted.includes(readId);
+}
+
+/**
+ * The run after one read, doubtful or not.
+ *
+ * A read the server was happy with breaks it: three in a row is a pile, three
+ * scattered through sixty is not.
+ */
+export function afterRead(run: DoubtRun, readId: string, doubtful: boolean): DoubtRun {
+  if (!doubtful) return NO_DOUBT_RUN;
+  if (alreadyCounted(run, readId)) return run;
+  return { count: run.count + 1, counted: [...run.counted, readId] };
+}
