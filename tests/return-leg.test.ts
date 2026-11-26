@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { and, eq } from 'drizzle-orm';
 import { getDb } from '@/db';
 import { shipmentEvents, shipments } from '@/db/schema';
@@ -331,6 +332,65 @@ describe('what the return leg is allowed to say', () => {
 });
 
 /* ------------------------------------------------------------- storing the code */
+
+describe('the counts the return leg must not touch', () => {
+  /*
+   * "Correos tried twice" is said down a phone to a customer, and a delivered
+   * return leg carries an `out_for_delivery` and often a `failed` of its own —
+   * Correos describe the journey back in exactly the words they use for the
+   * journey out, because to them it IS one, with us as the addressee. So an
+   * attempt count that does not name a leg counts the van that came to OUR
+   * door as a visit to the customer's.
+   *
+   * Read out of the SQL rather than driven through the database, and that is
+   * the stronger test of the two here: one inserted return event proves one
+   * subquery, while this holds every subquery in the file, including the next
+   * one somebody adds. The two that count attempts are inside a raw template
+   * literal, where nothing else can check them.
+   */
+  const SQL = readFileSync('lib/views/parcels.ts', 'utf8')
+    // SQL comments inside the template literal talk about `leg` at length.
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*--.*$/gm, '');
+
+  /** Each `FROM shipment_events` subquery, up to the end of its lateral. */
+  function subqueries(): string[] {
+    const out: string[] = [];
+    const starts = /FROM shipment_events/g;
+    for (let m = starts.exec(SQL); m; m = starts.exec(SQL)) {
+      const rest = SQL.slice(m.index);
+      const end = rest.indexOf('ON true');
+      out.push(rest.slice(0, end === -1 ? 500 : end));
+    }
+    return out;
+  }
+
+  it('is actually reading the SQL — an empty sweep would pass by accident', () => {
+    expect(subqueries().length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('names a leg in every count that turns on what an event means', () => {
+    /*
+     * The narrow claim, because the broad one is false and worth saying why:
+     * the pre-admission lateral takes `min(occurred_at)` of one event code
+     * over both legs and does not need a leg, and `lib/shipments/remap.ts`
+     * re-maps stored events by their wording, which is leg-independent on
+     * purpose. What may never be leg-blind is a subquery that decides
+     * something FROM `mapped_state`.
+     */
+    const blind = subqueries()
+      .filter((q) => q.includes('mapped_state'))
+      .filter((q) => !/\bleg\s*=\s*'/.test(q));
+
+    expect(blind).toEqual([]);
+  });
+
+  it('counts attempts and tries on the outbound leg by name', () => {
+    const counting = subqueries().filter((q) => /mapped_state\s*=\s*'(failed|out_for_delivery)'/.test(q));
+    expect(counting).toHaveLength(2);
+    for (const q of counting) expect(q).toMatch(/\bleg\s*=\s*'outbound'/);
+  });
+});
 
 describe('which return code a parcel gets', () => {
   it('refuses a code that is not this parcel coming back', () => {

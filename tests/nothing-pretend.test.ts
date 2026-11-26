@@ -271,26 +271,104 @@ describe('the labels stored on a task', () => {
     'lib/escalation/outcomes.ts',
     'lib/escalation/run.ts',
     'lib/escalation/tasks.ts',
+    // The ladder writes labels of its own and hands them over as
+    // `rung.effect.label`, so sweeping only the files that CALL openTask read
+    // none of them. Eight of the twenty-two label sites in the other four
+    // files were invisible too — see `labels` below.
+    'lib/escalation/ladder.ts',
   ];
 
-  /** Every `label:` passed to an openTask call in these files. */
-  function labels(): { file: string; label: string }[] {
-    return OPENERS.flatMap((file) => {
-      const src = codeOf(file);
-      const out: { file: string; label: string }[] = [];
-      const pattern = /label:\s*'([^']*)'/g;
-      for (let m = pattern.exec(src); m; m = pattern.exec(src)) {
-        out.push({ file, label: m[1] });
+  /**
+   * The whole value written after a `label:`, however it is written.
+   *
+   * `label:\s*'...'` — which is what this asked for at first — reads only a
+   * label that is a single-quoted literal sitting immediately after the colon.
+   * That missed every template literal (`Must call${...}`, `No update for
+   * ${n} days — ask Correos`) and both arms of every ternary (`Landline only
+   * — no WhatsApp, call them`), which is to say it missed eight of the
+   * twenty-two label sites in these files while the comment above claimed all
+   * of them were checked. A sweep that silently reads two thirds of its
+   * subject is worse than no sweep: it reports clean.
+   *
+   * So: find the colon, then walk to the end of the expression — the first
+   * comma, closing brace or semicolon that is not inside brackets or quotes.
+   */
+  function valueAfter(src: string, colon: number): string {
+    let i = colon + 1;
+    let depth = 0;
+    while (i < src.length) {
+      const c = src[i];
+      if (c === "'" || c === '"' || c === '`') {
+        const quote = c;
+        for (i += 1; i < src.length && src[i] !== quote; i += 1) {
+          if (src[i] === '\\') i += 1;
+        }
+        i += 1;
+        continue;
       }
-      return out;
-    });
+      if (c === '(' || c === '[' || c === '{') depth += 1;
+      else if (c === ')' || c === ']' || c === '}') {
+        if (depth === 0) break;
+        depth -= 1;
+      } else if ((c === ',' || c === ';') && depth === 0) break;
+      i += 1;
+    }
+    return src.slice(colon + 1, i);
+  }
+
+  /** Every label written in these files, in any of the forms they use. */
+  function labels(): { file: string; label: string }[] {
+    const out: { file: string; label: string }[] = [];
+    for (const file of OPENERS) {
+      const src = codeOf(file);
+      const sites = /\blabel:/g;
+      for (let m = sites.exec(src); m; m = sites.exec(src)) {
+        const value = valueAfter(src, m.index + m[0].length - 1);
+        const literal = /'([^']*)'|"([^"]*)"|`([^`]*)`/g;
+        for (let q = literal.exec(value); q; q = literal.exec(value)) {
+          // `${...}` is a number or a name at run time, and none of the
+          // wordings below turn on one. Reading it as "…" keeps the prose
+          // checks on the prose.
+          out.push({ file, label: (q[1] ?? q[2] ?? q[3]).replace(/\$\{[^}]*\}/g, '…') });
+        }
+      }
+    }
+    return out;
   }
 
   it('is actually finding them — an empty sweep would pass by accident', () => {
     const found = labels();
     expect(found.map((l) => l.label)).toContain('Put back in stock');
-    // The five receive_return openers, plus the ladder's own.
-    expect(found.length).toBeGreaterThanOrEqual(5);
+    /*
+     * A floor, not a count, so adding a task does not break the test — but a
+     * floor high enough that losing the template literals or the ternary arms
+     * does. The sweep found fourteen before the ladder and the other forms
+     * were added to it.
+     */
+    expect(found.length).toBeGreaterThanOrEqual(24);
+  });
+
+  it('leaves no label unread, whatever shape somebody writes it in', () => {
+    /*
+     * The guard on the guard. Every `label:` in these files must either hand
+     * back some prose or be a plain handover — `spec.label`,
+     * `rung.effect.label`, a `label: string` in a type. Anything else is a
+     * form this sweep cannot read, and it fails here rather than being
+     * counted as clean.
+     */
+    const unread: string[] = [];
+    for (const file of OPENERS) {
+      const src = codeOf(file);
+      const sites = /\blabel:/g;
+      for (let m = sites.exec(src); m; m = sites.exec(src)) {
+        const value = valueAfter(src, m.index + m[0].length - 1);
+        if (/['"`]/.test(value)) continue;
+        // A bare name, a property path, or a type. No prose can hide in one.
+        if (/^[\s\w.$|]*$/.test(value)) continue;
+        unread.push(`${file} — label:${value.trim()}`);
+      }
+    }
+    expect(unread).toEqual([]);
   });
 
   it('promises nothing about where the parcel will be later', () => {
